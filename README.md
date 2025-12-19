@@ -1,6 +1,62 @@
 # GridScope
 
 **AI-Powered STEM Digital Twin for Automated Microscopy**
+
+---
+
+## MCP Integration (Model Context Protocol)
+
+GridScope exposes the STEM Digital Twin as an **MCP server**, enabling AI assistants like Claude Desktop to directly control the microscope through natural conversation.
+
+### Setup
+
+```bash
+# Install FastMCP
+pip install fastmcp
+
+# Start the Digital Twin server first
+cd backend && python run_digital_twin.py
+
+# In another terminal, start the MCP server
+cd MCP_Code && python hackathon_mcp_tem_client_2.py
+```
+
+The MCP server runs on `http://127.0.0.1:8081` using SSE transport.
+
+### Available MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_detectors()` | List available detectors |
+| `get_stage()` | Get current stage position |
+| `set_stage(x, y, relative)` | Move stage (x, y in meters) |
+| `get_beam()` | Get beam position |
+| `set_beam(x, y, relative)` | Set beam position |
+| `get_mode()` | Get microscope mode (IMG/DIFF) |
+| `set_mode(mode)` | Set microscope mode |
+| `acquire_image(device)` | Capture image from detector |
+| `autofocus(device, z_range_um, z_steps)` | Run autofocus routine |
+| `get_diffraction_settings()` | Get diffraction parameters |
+
+### Claude Desktop Configuration
+
+Add to your Claude Desktop config (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "gridscope-stem": {
+      "url": "http://127.0.0.1:8081/sse"
+    }
+  }
+}
+```
+
+Once configured, you can ask Claude to directly control the microscope:
+- *"Move the stage 5 micrometers to the right and acquire an image"*
+- *"Run autofocus and then take a diffraction pattern"*
+- *"What is the current stage position?"*
+
 ---
 
 ## Overview
