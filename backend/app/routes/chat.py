@@ -1,11 +1,34 @@
 """Chat API endpoints for the LLM microscopy assistant."""
 
+import json
 import os
+import re
 from fastapi import APIRouter, HTTPException
-from ..models.schemas import ChatRequest, ChatResponse, ChatMessage
+from ..models.schemas import ChatRequest, ChatResponse, ChatMessage, ExecutionPlan
 from ..services.llm_agent import LLMAgent
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+
+def _extract_execution_plan(text: str) -> ExecutionPlan | None:
+    """Extract a ```json execution plan block from LLM response text.
+
+    Returns None on parse failure (graceful fallback).
+    """
+    # Find ```json blocks
+    for match in re.finditer(r"```json\s*\n(.*?)```", text, re.DOTALL):
+        raw = match.group(1).strip()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        # Must look like an execution plan (has plan_type and steps)
+        if isinstance(data, dict) and "plan_type" in data and "steps" in data:
+            try:
+                return ExecutionPlan(**data)
+            except Exception:
+                continue
+    return None
 
 
 def get_agent() -> LLMAgent:
@@ -38,18 +61,21 @@ async def chat(request: ChatRequest) -> ChatResponse:
             additional_context=request.context,
         )
         
-        # Parse response for suggested actions and code blocks
+        # Parse response for suggested actions, code blocks, and execution plans
         suggested_actions = []
         generated_code = None
-        
+        execution_plan = None
+
         # Check if response contains code
         if "```python" in response_text:
-            # Extract code block
             code_start = response_text.find("```python") + 9
             code_end = response_text.find("```", code_start)
             if code_end > code_start:
                 generated_code = response_text[code_start:code_end].strip()
-        
+
+        # Extract execution plan JSON block
+        execution_plan = _extract_execution_plan(response_text)
+
         # Look for action suggestions
         action_keywords = [
             "I suggest",
@@ -58,18 +84,19 @@ async def chat(request: ChatRequest) -> ChatResponse:
             "Try",
             "Recommended",
         ]
-        
+
         for line in response_text.split("\n"):
             for keyword in action_keywords:
                 if keyword in line and len(line) < 200:
                     suggested_actions.append(line.strip())
                     break
-        
+
         return ChatResponse(
             message=response_text,
-            suggested_actions=suggested_actions[:5],  # Limit to 5 suggestions
+            suggested_actions=suggested_actions[:5],
             generated_code=generated_code,
             explanation=None,
+            execution_plan=execution_plan,
         )
         
     except ValueError as e:

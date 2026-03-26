@@ -9,148 +9,16 @@ import os
 from typing import Optional
 from openai import AsyncOpenAI
 from ..models.schemas import ExperimentConfig, CodeGenerationRequest
+from ..constants import DEFAULT_DETECTOR, MICROSCOPE_API_SPEC, TEM_CLIENT_SOURCE_PATH
 
 
-# Complete TEMClient code that matches tem_client.py exactly
-TEM_CLIENT_CODE = '''
-import socket
-import json
-import base64
-import numpy as np
-from typing import Any, Optional, Dict, List
+def _load_tem_client_code() -> str:
+    """Read tem_client.py source at import time for embedding in generated scripts."""
+    return TEM_CLIENT_SOURCE_PATH.read_text()
 
 
-class TEMClient:
-    """Client for communicating with the TEM Digital Twin server."""
-
-    def __init__(self, host: str = "127.0.0.1", port: int = 9094, timeout: int = 30):
-        self.host = host
-        self.port = port
-        self.timeout = timeout
-        self._next_id = 1
-
-    def _to_netstring(self, obj: dict) -> bytes:
-        payload = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-        return f"{len(payload)}:".encode("ascii") + payload + b","
-
-    def _recv_exact(self, sock: socket.socket, n: int) -> bytes:
-        chunks = []
-        remaining = n
-        while remaining > 0:
-            chunk = sock.recv(remaining)
-            if not chunk:
-                raise ConnectionError("Connection closed while reading response")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
-    def _recv_netstring(self, sock: socket.socket) -> dict:
-        length_bytes = b""
-        while True:
-            c = sock.recv(1)
-            if not c:
-                raise ConnectionError("No response from server")
-            if c == b":":
-                break
-            length_bytes += c
-        length = int(length_bytes.decode("ascii"))
-        payload = self._recv_exact(sock, length)
-        trailing = self._recv_exact(sock, 1)
-        if trailing != b",":
-            raise RuntimeError("Malformed netstring (missing trailing comma)")
-        return json.loads(payload.decode("utf-8"))
-
-    def _call(self, method: str, params: Optional[dict] = None) -> Any:
-        if params is None:
-            params = {}
-        msg = {
-            "jsonrpc": "2.0",
-            "id": self._next_id,
-            "method": method,
-            "params": params,
-        }
-        self._next_id += 1
-        with socket.create_connection(
-            (self.host, self.port), timeout=self.timeout
-        ) as sock:
-            sock.settimeout(self.timeout)
-            sock.sendall(self._to_netstring(msg))
-            reply = self._recv_netstring(sock)
-        if "error" in reply:
-            raise RuntimeError(f"Server error: {reply['error']}")
-        return reply.get("result", None)
-
-    def is_connected(self) -> bool:
-        """Check if we can connect to the server."""
-        try:
-            with socket.create_connection(
-                (self.host, self.port), timeout=2
-            ) as sock:
-                sock.close()
-                return True
-        except (ConnectionRefusedError, TimeoutError, OSError):
-            return False
-
-    def get_detectors(self) -> List[str]:
-        """Get list of available detectors."""
-        return self._call("get_detectors")
-
-    def get_detector_settings(self, device: str) -> Optional[Dict[str, Any]]:
-        """Get current settings for a detector."""
-        return self._call("get_detector_settings", {"device": device})
-
-    def device_settings(self, device: str, **kwargs) -> int:
-        """Update detector settings."""
-        return self._call("device_settings", {"device": device, **kwargs})
-
-    def get_stage(self) -> List[float]:
-        """Get current stage position [x, y, z, a, b] in METERS."""
-        return self._call("get_stage")
-
-    def get_microscope_state(self) -> Dict[str, Any]:
-        """Get complete microscope state for UI sync."""
-        return self._call("get_microscope_state")
-
-    def set_stage(
-        self, stage_positions: Dict[str, float], relative: bool = True
-    ) -> Dict[str, Any]:
-        """Set stage position. Positions should be in METERS."""
-        return self._call(
-            "set_stage", {"stage_positions": stage_positions, "relative": relative}
-        )
-
-    def acquire_image(self, device: str, **kwargs) -> np.ndarray:
-        """Acquire an image from the specified detector."""
-        result = self._call("acquire_image", {"device": device, **kwargs})
-
-        if isinstance(result, dict) and "__ndarray_b64__" in result:
-            raw = base64.b64decode(result["__ndarray_b64__"])
-            arr = np.frombuffer(raw, dtype=np.dtype(result["dtype"]))
-            return arr.reshape(tuple(result["shape"]))
-
-        if isinstance(result, (list, tuple)) and len(result) == 3:
-            array_list, shape, dtype = result
-            return np.array(array_list, dtype=dtype).reshape(shape)
-
-        return result
-
-    def autofocus(
-        self, device: str = "flu_camera", z_range_um: float = 2.0, z_steps: int = 9
-    ) -> Dict[str, Any]:
-        """Run autofocus routine."""
-        return self._call(
-            "autofocus",
-            {"device": device, "z_range_um": z_range_um, "z_steps": z_steps},
-        )
-
-    def get_command_log(self, last_n: int = 50) -> List[Dict[str, Any]]:
-        """Get recent command log."""
-        return self._call("get_command_log", {"last_n": last_n})
-
-    def clear_command_log(self) -> int:
-        """Clear the command log."""
-        return self._call("clear_command_log")
-'''
+# Auto-generated from the canonical tem_client.py source file
+TEM_CLIENT_CODE = _load_tem_client_code()
 
 
 # Code template for digital twin
@@ -231,14 +99,14 @@ def run_experiment():
 
     # Configure the camera
     tem.device_settings(
-        "flu_camera",
+        "haadf",
         field_of_view_um=CONFIG["field_of_view_um"],
         noise_sigma=CONFIG["noise_sigma"]
     )
     print(f"Camera configured: FOV={{CONFIG['field_of_view_um']}} µm")
     
     # Get detector settings to confirm
-    detector_settings = tem.get_detector_settings("flu_camera")
+    detector_settings = tem.get_detector_settings("haadf")
     print(f"Detector settings: {{detector_settings}}")
 
     # Calculate tile positions
@@ -270,14 +138,14 @@ def run_experiment():
         # Autofocus if enabled
         if CONFIG["autofocus_enabled"]:
             af_result = tem.autofocus(
-                device="flu_camera", 
+                device="haadf", 
                 z_range_um=CONFIG["autofocus_z_range_um"], 
                 z_steps=CONFIG["autofocus_z_steps"]
             )
             print(f"  Autofocus: Z adjusted by {{af_result['best_z_um_relative']:.2f}} µm")
 
         # Acquire image
-        img = tem.acquire_image("flu_camera")
+        img = tem.acquire_image("haadf")
         acquired_images.append({{
             "tile_index": tile_index,
             "x_um": x_um,
@@ -415,29 +283,19 @@ Objective: {request.objective}
 
 Additional Requirements: {request.additional_requirements or 'None'}
 
-IMPORTANT: You MUST use ONLY these TEMClient methods:
-- tem.is_connected() -> bool
-- tem.get_detectors() -> List[str]  
-- tem.get_detector_settings(device: str) -> Dict
-- tem.device_settings(device: str, **kwargs) -> int
-- tem.get_stage() -> List[float]  # Returns [x,y,z,a,b] in METERS
-- tem.get_microscope_state() -> Dict
-- tem.set_stage(stage_positions: Dict, relative: bool) -> Dict  # Positions in METERS
-- tem.acquire_image(device: str) -> np.ndarray
-- tem.autofocus(device, z_range_um, z_steps) -> Dict
-- tem.get_command_log(last_n) -> List
-- tem.clear_command_log() -> int
+{MICROSCOPE_API_SPEC}
 
-Include the full TEMClient class in your code.
+Include the full STEMClient class in your code (import from tem_client or embed it).
 Stage positions must be in METERS (multiply µm by 1e-6).
+Always use "{DEFAULT_DETECTOR}" as the detector name.
 
 Respond with JSON:
-{{
-    "code": "complete python code with TEMClient class included",
+{{{{
+    "code": "complete python code with STEMClient class included",
     "explanation": "what the code does",
     "warnings": ["safety notes"],
     "suggested_modifications": ["customization ideas"]
-}}"""
+}}}}"""
 
         response = await self.client.chat.completions.create(
             model=self.model,

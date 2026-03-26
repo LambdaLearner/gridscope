@@ -29,7 +29,7 @@ export interface ExecuteResult {
 }
 
 export interface SimpleExecuteParams {
-  action: 'acquire' | 'move' | 'autofocus' | 'scan_grid';
+  action: 'acquire' | 'move' | 'tilt' | 'autofocus' | 'scan_grid';
   params?: Record<string, unknown>;
 }
 
@@ -152,6 +152,32 @@ export async function runAutofocus(
   z_steps: number = 9
 ): Promise<AutofocusResult> {
   return executeSimple('autofocus', { z_range_um, z_steps });
+}
+
+export interface TiltResult {
+  success: boolean;
+  action: string;
+  new_position: {
+    x_um: number;
+    y_um: number;
+    z_um: number;
+    a: number;
+    b: number;
+  };
+}
+
+/**
+ * Set stage tilt angles
+ */
+export async function tiltStage(
+  a?: number,
+  b?: number,
+  relative: boolean = false
+): Promise<TiltResult> {
+  const params: Record<string, unknown> = { relative };
+  if (a !== undefined) params.a = a;
+  if (b !== undefined) params.b = b;
+  return executeSimple('tilt', params);
 }
 
 /**

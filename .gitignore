@@ -36,3 +36,7 @@ backend/.env
 .pytest_cache/
 .coverage
 htmlcov/
+
+
+.bolt/
+claude.md

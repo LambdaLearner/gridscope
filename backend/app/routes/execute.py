@@ -9,6 +9,7 @@ from pydantic import BaseModel
 import json
 
 from ..digital_twin.tem_client import TEMClient
+from ..constants import DEFAULT_DETECTOR
 
 router = APIRouter(prefix="/execute", tags=["execute"])
 
@@ -51,7 +52,7 @@ async def execute_operations(request: ExecuteRequest):
             params = op.get("params", {})
             
             if operation == "acquire_image":
-                device = params.get("device", "flu_camera")
+                device = params.get("device", DEFAULT_DETECTOR)
                 result = client.acquire_image_base64(device)
                 stage = client.get_stage()
                 results.append({
@@ -86,7 +87,7 @@ async def execute_operations(request: ExecuteRequest):
                 })
                 
             elif operation == "autofocus":
-                device = params.get("device", "flu_camera")
+                device = params.get("device", DEFAULT_DETECTOR)
                 z_range = params.get("z_range_um", 4.0)
                 z_steps = params.get("z_steps", 9)
                 result = client.autofocus(device, z_range, z_steps)
@@ -97,7 +98,7 @@ async def execute_operations(request: ExecuteRequest):
                 })
                 
             elif operation == "device_settings":
-                device = params.get("device", "flu_camera")
+                device = params.get("device", DEFAULT_DETECTOR)
                 settings = {k: v for k, v in params.items() if k != "device"}
                 client.device_settings(device, **settings)
                 updated = client.get_detector_settings(device)

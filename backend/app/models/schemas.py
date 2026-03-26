@@ -50,12 +50,27 @@ class ChatRequest(BaseModel):
     context: Optional[str] = None
 
 
+class ExecutionStep(BaseModel):
+    """A single step in a structured execution plan."""
+    action: str = Field(..., description="Action to execute (e.g. acquire, move, tilt, autofocus, set_mode, set_beam, set_sample)")
+    params: dict = Field(default_factory=dict, description="Parameters for the action")
+    description: str = Field(default="", description="Human-readable description of this step")
+
+
+class ExecutionPlan(BaseModel):
+    """Structured execution plan returned alongside generated code."""
+    plan_type: str = Field(..., description="Type of plan (e.g. tilt_series, grid_scan, single_acquisition)")
+    steps: list[ExecutionStep] = Field(default_factory=list)
+    summary: str = Field(default="", description="Human-readable summary of the plan")
+
+
 class ChatResponse(BaseModel):
     """Response from chat completion."""
     message: str
     suggested_actions: list[str] = []
     generated_code: Optional[str] = None
     explanation: Optional[str] = None
+    execution_plan: Optional[ExecutionPlan] = None
 
 
 class CodeGenerationRequest(BaseModel):

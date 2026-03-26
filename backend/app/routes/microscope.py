@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from ..digital_twin.tem_client import TEMClient
+from ..constants import DEFAULT_DETECTOR
 
 router = APIRouter(prefix="/microscope", tags=["microscope"])
 
@@ -53,11 +54,11 @@ class DetectorSettings(BaseModel):
 
 
 class AcquireImageRequest(BaseModel):
-    device: str = "flu_camera"
+    device: str = DEFAULT_DETECTOR
 
 
 class AutofocusRequest(BaseModel):
-    device: str = "flu_camera"
+    device: str = DEFAULT_DETECTOR
     z_range_um: float = 2.0
     z_steps: int = 9
 

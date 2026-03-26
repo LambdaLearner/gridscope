@@ -587,8 +587,11 @@ class STEMServer(object):
         best_score = -1e18
         best_z = z0
 
+        # Temporarily reduce detector size and disable noise for faster sharpness sweep
         old_noise = self.detectors[device].get("noise_sigma", 12.0)
+        old_size = self.detectors[device].get("size", 256)
         self.detectors[device]["noise_sigma"] = 0.0
+        self.detectors[device]["size"] = 64  # ~16x faster than 256
 
         for z_m, z_um in zip(zs_m, zs_um):
             self.sim.stage["z"] = float(z_m)
@@ -600,6 +603,7 @@ class STEMServer(object):
                 best_z = float(z_m)
 
         self.detectors[device]["noise_sigma"] = old_noise
+        self.detectors[device]["size"] = old_size
         self.sim.stage["z"] = best_z
 
         result = {

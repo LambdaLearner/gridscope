@@ -1,21 +1,30 @@
 import { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { Bot, Send, Code, Loader2, Sparkles, X, Maximize2, Minimize2, Play } from 'lucide-react';
+import { Bot, Send, Code, Loader2, Sparkles, X, Maximize2, Minimize2, Play, RotateCcw } from 'lucide-react';
 import { ExperimentConfig } from '../types/config';
+import type { ExecutionPlan } from '../types/execution';
 
 interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   code?: string;
+  executionPlan?: ExecutionPlan;
   timestamp: Date;
 }
 
 interface AIAssistantProps {
   experimentConfig: ExperimentConfig | null;
   onCodeGenerated?: (code: string) => void;
-  onRunCode?: (code: string) => void;
+  onRunCode?: (code: string, executionPlan?: ExecutionPlan) => void;
 }
+
+const INITIAL_MESSAGE: Message = {
+  id: '1',
+  role: 'assistant',
+  content: "Hello! I'm your **STEM Digital Twin** assistant. I can help you:\n\n- **Control the microscope** - move stage, adjust settings, switch imaging/diffraction modes\n- **Switch samples** - Au nanoparticles or FCC crystal\n- **Acquire images** - single shots or grid scans\n- **Generate Python scripts** - for automated experiments\n\nWhat would you like to do?",
+  timestamp: new Date(),
+};
 
 const QUICK_PROMPTS = [
   "Acquire an image at the current position",
@@ -25,14 +34,7 @@ const QUICK_PROMPTS = [
 ];
 
 export function AIAssistant({ experimentConfig, onCodeGenerated, onRunCode }: AIAssistantProps) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: '1',
-      role: 'assistant',
-      content: "Hello! I'm your **STEM Digital Twin** assistant. I can help you:\n\n- **Control the microscope** - move stage, adjust settings, switch imaging/diffraction modes\n- **Switch samples** - Au nanoparticles or FCC crystal\n- **Acquire images** - single shots or grid scans\n- **Generate Python scripts** - for automated experiments\n\nWhat would you like to do?",
-      timestamp: new Date(),
-    }
-  ]);
+  const [messages, setMessages] = useState<Message[]>([INITIAL_MESSAGE]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -87,6 +89,7 @@ export function AIAssistant({ experimentConfig, onCodeGenerated, onRunCode }: AI
         role: 'assistant',
         content: data.message,
         code: data.generated_code,
+        executionPlan: data.execution_plan,
         timestamp: new Date(),
       };
 
@@ -170,10 +173,15 @@ export function AIAssistant({ experimentConfig, onCodeGenerated, onRunCode }: AI
     }
   };
 
-  const handleRunCode = (code: string) => {
+  const handleRunCode = (code: string, executionPlan?: ExecutionPlan) => {
     if (onRunCode) {
-      onRunCode(code);
+      onRunCode(code, executionPlan);
     }
+    setShowCode(null);
+  };
+
+  const clearChat = () => {
+    setMessages([{ ...INITIAL_MESSAGE, id: Date.now().toString(), timestamp: new Date() }]);
     setShowCode(null);
   };
 
@@ -199,6 +207,17 @@ export function AIAssistant({ experimentConfig, onCodeGenerated, onRunCode }: AI
             <Code className="w-3 h-3" />
             Generate Script
           </button>
+          {messages.length > 1 && (
+            <button
+              onClick={clearChat}
+              disabled={isLoading}
+              className="flex items-center gap-1 px-2 py-1 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 rounded-md transition-colors disabled:opacity-50"
+              title="Clear chat"
+            >
+              <RotateCcw className="w-3 h-3" />
+              Clear
+            </button>
+          )}
           <button
             onClick={() => setIsExpanded(!isExpanded)}
             className="p-1.5 hover:bg-slate-700 rounded-md transition-colors"
@@ -269,7 +288,7 @@ export function AIAssistant({ experimentConfig, onCodeGenerated, onRunCode }: AI
                   </button>
                   {onRunCode && (
                     <button
-                      onClick={() => handleRunCode(message.code!)}
+                      onClick={() => handleRunCode(message.code!, message.executionPlan)}
                       className="flex items-center gap-1 text-xs text-emerald-300 hover:text-emerald-200 transition-colors bg-emerald-900/30 px-2 py-1 rounded"
                     >
                       <Play className="w-3 h-3" />

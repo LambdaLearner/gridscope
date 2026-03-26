@@ -3,6 +3,7 @@
  */
 
 import { ExperimentConfig } from '../types/config';
+import type { ExecutionPlan } from '../types/execution';
 
 const API_BASE_URL = 'http://localhost:8000/api';
 
@@ -22,6 +23,7 @@ export interface ChatResponse {
   suggested_actions: string[];
   generated_code?: string;
   explanation?: string;
+  execution_plan?: ExecutionPlan;
 }
 
 export interface CodeGenerationRequest {

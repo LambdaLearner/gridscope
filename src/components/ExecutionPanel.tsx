@@ -1,41 +1,17 @@
-import { useState, useEffect, useRef } from 'react';
-import { 
-  Play, 
-  Square, 
-  Terminal, 
-  CheckCircle2, 
-  XCircle, 
-  Clock, 
+import { useState, useEffect, useRef, memo } from 'react';
+import {
+  Play,
+  Square,
+  Terminal,
+  CheckCircle2,
+  XCircle,
+  Clock,
   Image as ImageIcon,
   Loader2,
   ChevronDown,
   ChevronUp
 } from 'lucide-react';
-
-interface ExecutionLog {
-  id: string;
-  type: 'info' | 'success' | 'error' | 'image' | 'stage' | 'command';
-  message: string;
-  timestamp: Date;
-  data?: {
-    image_base64?: string;
-    stage?: { x_um: number; y_um: number; z_um: number; a?: number; b?: number };
-    command?: string;
-    sampleType?: string;
-    mode?: string;
-  };
-}
-
-interface AcquiredImageData {
-  image_base64: string;
-  x_um: number;
-  y_um: number;
-  z_um?: number;
-  a?: number;  // alpha tilt angle
-  b?: number;  // beta tilt angle
-  sampleType?: string;
-  mode?: string;
-}
+import type { ExecutionLog, AcquiredImage } from '../types/execution';
 
 interface ExecutionPanelProps {
   code: string | null;
@@ -43,16 +19,16 @@ interface ExecutionPanelProps {
   onStart: () => void;
   onStop: () => void;
   logs: ExecutionLog[];
-  acquiredImages: AcquiredImageData[];
+  acquiredImages: AcquiredImage[];
   currentSampleType?: string;
   currentMode?: string;
 }
 
-export function ExecutionPanel({ 
-  code, 
-  isRunning, 
-  onStart, 
-  onStop, 
+export const ExecutionPanel = memo(function ExecutionPanel({
+  code,
+  isRunning,
+  onStart,
+  onStop,
   logs,
   acquiredImages,
   currentSampleType = 'au_nanoparticles',
@@ -225,6 +201,14 @@ export function ExecutionPanel({
                           α={log.data.stage?.a?.toFixed(1) || 0}° β={log.data.stage?.b?.toFixed(1) || 0}°
                         </div>
                       )}
+                      {(log.data.voltage_kV || log.data.current_pA) && (
+                        <div className="font-mono text-cyan-400">
+                          {log.data.voltage_kV ? `${log.data.voltage_kV} kV` : ''}
+                          {log.data.voltage_kV && log.data.current_pA ? ' · ' : ''}
+                          {log.data.current_pA ? `${log.data.current_pA} pA` : ''}
+                          {log.data.fov_um ? ` · FOV ${log.data.fov_um} µm` : ''}
+                        </div>
+                      )}
                       <div className="mt-1 text-slate-500">
                         256×256 px • {getSampleLabel(log.data.sampleType || currentSampleType)}
                         {log.data.mode === 'DIFF' && ' • Diffraction'}
@@ -296,6 +280,14 @@ export function ExecutionPanel({
                   α={acquiredImages[selectedImage].a?.toFixed(1) || 0}° β={acquiredImages[selectedImage].b?.toFixed(1) || 0}°
                 </div>
               )}
+              {(acquiredImages[selectedImage].voltage_kV || acquiredImages[selectedImage].current_pA) && (
+                <div className="text-cyan-400">
+                  {acquiredImages[selectedImage].voltage_kV ? `${acquiredImages[selectedImage].voltage_kV} kV` : ''}
+                  {acquiredImages[selectedImage].voltage_kV && acquiredImages[selectedImage].current_pA ? ' · ' : ''}
+                  {acquiredImages[selectedImage].current_pA ? `${acquiredImages[selectedImage].current_pA} pA` : ''}
+                  {acquiredImages[selectedImage].fov_um ? ` · FOV ${acquiredImages[selectedImage].fov_um} µm` : ''}
+                </div>
+              )}
             </div>
           </div>
           <img 
@@ -307,5 +299,4 @@ export function ExecutionPanel({
       )}
     </div>
   );
-}
-
+});
