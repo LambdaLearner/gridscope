@@ -1,27 +1,30 @@
 """
 samples/dislocation_crystal.py
-FCC single crystal containing an edge dislocation. The dislocation displacement
-field is applied to the atom positions, so diffraction shows the local lattice
-distortion (streaking / spot broadening near the core) -- a defect signature.
+Fe FCC single crystal containing MANY edge dislocations. Each dislocation's
+isotropic-elasticity displacement field is applied to the atom positions, so
+diffraction shows the cumulative local lattice distortion (streaking / spot
+broadening / mosaic spread) -- the signature of a heavily dislocated (worked)
+crystal. Contrast with the clean crystals, which give sharp spots.
 """
 import numpy as np
-from .base import Sample, SampleMetadata, CrystalLattice, tile_lattice_in_region
+from .base import Sample, SampleMetadata, CrystalLattice, tile_lattice_in_region, make_lamella_slab
 from . import register
 
 
 @register
 class DislocationCrystal(Sample):
     feature_scale_nm = 0.25   # lattice fringe spacing (~0.25 nm)
-    sample_fov_um = 0.5
     meta = SampleMetadata(
         name="dislocation_crystal",
-        display_name="FCC Crystal with Edge Dislocation",
-        description="FCC single crystal with an edge dislocation displacement field.",
+        display_name="Fe FCC with Edge Dislocations (many)",
+        description="Fe FCC crystal with a field of many edge dislocations.",
         default_params={
-            "a_angstrom": 4.05,
-            "atomic_number": 79,
-            "burgers_A": 4.05,          # Burgers vector magnitude (~ a)
-            "poisson_ratio": 0.34,
+            "a_angstrom": 3.571,        # gamma-Fe (austenite)
+            "atomic_number": 26,        # Fe
+            "n_dislocations": 12,       # number of edge dislocations in the region
+            "burgers_A": 3.571,         # Burgers vector magnitude (~ a)
+            "poisson_ratio": 0.29,
+            "disl_seed": 7,
             "base_level": 90.0,
             "atom_intensity": 9000.0,
             "sigma_px": 1.1,
@@ -30,8 +33,10 @@ class DislocationCrystal(Sample):
         param_schema={
             "a_angstrom":     {"type": "float", "min": 1.0,  "max": 20.0},
             "atomic_number":  {"type": "int",   "min": 1,    "max": 100},
+            "n_dislocations": {"type": "int",   "min": 1,    "max": 40},
             "burgers_A":      {"type": "float", "min": 0.5,  "max": 10.0},
-            "poisson_ratio":  {"type": "float", "min": 0.0,  "max": 0.5},
+            "poisson_ratio":  {"type": "float", "min": 0.0,  "max": 0.49},
+            "disl_seed":      {"type": "int",   "min": 0,    "max": 2**31-1},
             "base_level":     {"type": "float", "min": 0,    "max": 1000},
             "atom_intensity": {"type": "float", "min": 100,  "max": 60000},
             "sigma_px":       {"type": "float", "min": 0.5,  "max": 4.0},
@@ -49,55 +54,65 @@ class DislocationCrystal(Sample):
             basis=[((0,0,0),Z),((0,0.5,0.5),Z),((0.5,0,0.5),Z),((0.5,0.5,0),Z)],
             name="FCC-dislocation")
 
-    def _apply_edge_dislocation(self, pos):
-        """Apply the displacement field of an edge dislocation lying along z with
-        Burgers vector b along x. Classic isotropic elasticity solution."""
+    def _dislocation_cores(self, half_A):
+        """Deterministic in-plane core positions (A) via disl_seed. Cores are kept
+        away from the very edge so their strain fields act within the region."""
+        n = int(self.params.get("n_dislocations", 12))
+        rng = np.random.default_rng(int(self.params.get("disl_seed", 7)))
+        cores = rng.uniform(-0.8 * half_A, 0.8 * half_A, size=(max(0, n), 2))
+        # random Burgers sign per dislocation (edge dipoles / mixed population)
+        signs = rng.choice([-1.0, 1.0], size=max(0, n))
+        return cores, signs
+
+    def _apply_edge_dislocations(self, pos, half_A):
+        """Superpose the displacement fields of many edge dislocations (each line
+        along the beam z, Burgers vector along x). Classic isotropic elasticity
+        (Hirth & Lothe), softened core."""
         b = float(self.params["burgers_A"])
         nu = float(self.params["poisson_ratio"])
-        x = pos[:,0].copy(); y = pos[:,1].copy()
-        r2 = x*x + y*y + 1.0  # +1 to soften the core singularity
-        # ux, uy from Hirth & Lothe (edge dislocation)
-        ux = (b/(2*np.pi)) * (np.arctan2(y, x) + (x*y)/(2*(1-nu)*r2))
-        uy = -(b/(2*np.pi)) * ((1-2*nu)/(4*(1-nu))*np.log(r2) + (x*x - y*y)/(4*(1-nu)*r2))
+        cores, signs = self._dislocation_cores(half_A)
         out = pos.copy()
-        out[:,0] += ux
-        out[:,1] += uy
+        for (cx, cy), sgn in zip(cores, signs):
+            x = pos[:, 0] - cx
+            y = pos[:, 1] - cy
+            r2 = x * x + y * y + 1.0     # +1 softens the core singularity
+            ux = sgn * (b/(2*np.pi)) * (np.arctan2(y, x) + (x*y)/(2*(1-nu)*r2))
+            uy = sgn * -(b/(2*np.pi)) * ((1-2*nu)/(4*(1-nu))*np.log(r2)
+                                         + (x*x - y*y)/(4*(1-nu)*r2))
+            out[:, 0] += ux
+            out[:, 1] += uy
         return out
+
+    def get_atoms_in_region(self, cx_um, cy_um, half_width_um, depth_nm):
+        """Tile an approximately cubic Fe-FCC region under the atom cap (no random
+        subsampling, which would itself smear the pattern), then superpose the
+        strain fields of many edge dislocations."""
+        a1, a2, a3 = self.lattice.real_vectors
+        cell_vol = abs(np.dot(a1, np.cross(a2, a3)))
+        density = len(self.lattice.basis) / cell_vol
+        target = 90000.0  # under the 100k cap -> no random subsampling
+        side_A = float((target / max(1e-9, density)) ** (1.0 / 3.0))
+        half_A = side_A / 2.0
+        bp, bZ = tile_lattice_in_region(self.lattice, half_A, side_A)
+        if len(bp) == 0:
+            return np.zeros((0,3)), np.zeros(0, dtype=np.int32)
+        if int(self.params.get("n_dislocations", 12)) > 0:
+            bp = self._apply_edge_dislocations(bp, half_A)
+        return bp.astype(np.float64), bZ.astype(np.int32)
 
     def generate_volume(self, D, H, W):
         p = self.params
         self._vol_shape = (D, H, W)
-        a_px = int(p["a_px"])
-        V = np.zeros((D, H, W), dtype=np.float32) + float(p["base_level"])
-        # Visualize: a dot lattice with an extra half-plane inserted above center
-        cy, cx = H/2.0, W/2.0
-        for iy in range(0, H, a_px):
-            for ix in range(0, W, a_px):
-                # insert extra half-plane: shift columns above the glide plane
-                shift = 0.5 * a_px if (iy < cy) else 0.0
-                xx = int(ix + shift) % W
-                for zz in range(D//2-6, D//2+6):
-                    V[zz, iy, xx] += float(p["atom_intensity"])
-        def gfreq(n, s):
-            f = np.fft.fftfreq(n).astype(np.float32)
-            return np.exp(-2.0*(np.pi**2)*(s**2)*(f**2)).astype(np.float32)
-        s = float(p["sigma_px"])
-        F = np.fft.fftn(V)
-        F *= gfreq(D,s)[:,None,None]; F *= gfreq(H,s)[None,:,None]; F *= gfreq(W,s)[None,None,:]
-        V = np.clip(np.fft.ifftn(F).real, 0, 65535).astype(np.float32)
-        return V
-
-    def get_atoms_in_region(self, cx_um, cy_um, half_width_um, depth_nm):
-        if not hasattr(self, "_vol_shape"):
-            return None, None
-        depth_A = depth_nm * 10.0
-        half_A = max(30.0, half_width_um * 1e4 * 0.02)  # compress to ~100k atoms
-        bp, bZ = tile_lattice_in_region(self.lattice, half_A, depth_A)
-        if len(bp) == 0:
-            return np.zeros((0,3)), np.zeros(0, dtype=np.int32)
-        # apply the dislocation displacement field (core at region center)
-        bp = self._apply_edge_dislocation(bp)
-        if len(bp) > 100000:
-            ii = np.random.default_rng(0).choice(len(bp), 100000, replace=False)
-            bp = bp[ii]; bZ = bZ[ii]
-        return bp.astype(np.float64), bZ.astype(np.int32)
+        # Like the other crystals, the dislocated crystal is a roughly uniform slab
+        # in HAADF at low/moderate magnification (the strain fields modulate the
+        # image only subtly). Atomic columns appear at high magnification via the
+        # server's real-atom projection (which uses this sample's dislocated
+        # get_atoms_in_region, so the columns show the strain). The defect signature
+        # is clearest in DIFFRACTION (broadened/streaked spots).
+        return make_lamella_slab(
+            D, H, W,
+            generation_range_um=self.generation_range_um,
+            sample_length_um=self.sample_length_um,
+            sample_width_um=self.sample_width_um,
+            base_level=float(p.get("base_level", 90.0)),
+            slab_level=41000.0, texture=0.06, seed=int(p.get("disl_seed", 7)))

@@ -172,7 +172,6 @@ class AtomskPolycrystal(Sample):
     # Polycrystals are atomistic — much smaller real extent than µm samples.
     # Override the physical mapping so a single Atomsk structure spans the
     # active FOV nicely. Users can still rescale via load_sample(...) params.
-    sample_fov_um = 50.0
     tilt_strength_px_per_slice = 0.35
 
     def generate_volume(self, D, H, W):
@@ -212,12 +211,22 @@ class AtomskPolycrystal(Sample):
         extent_A = np.maximum(pmax - pmin, 1e-6)
 
         if bool(p["auto_fit"]):
-            # Stretch XY to fill (with a small margin), preserve XY aspect ratio,
-            # center Z (don't stretch Z beyond available slices).
-            margin = 0.92
-            sxy = min((W * margin) / extent_A[0], (H * margin) / extent_A[1])
-            sz = min(sxy, (D * margin) / max(extent_A[2], 1e-6))
-            scales = np.array([sxy, sxy, sz], dtype=np.float32)
+            # TRUE-SCALE mapping (not stretch-to-fill). 1 voxel = generation range
+            # per W pixels, so atoms sit at their real physical size and the loaded
+            # structure occupies the correct fraction of the field -- consistent
+            # with get_atoms_in_region (which uses true Angstrom positions). A tiny
+            # cell will therefore look small (as it physically is); scale it up in
+            # Atomsk if you want it to fill more of the field.
+            #   voxels per Angstrom = (W / generation_range_um) / 1e4
+            vox_per_A = (W / float(self.generation_range_um)) / 1.0e4
+            scales = np.array([vox_per_A, vox_per_A, vox_per_A], dtype=np.float32)
+            # if the structure is far larger than the volume, fall back to a fit so
+            # it is at least visible (with a warning-friendly comment)
+            if (extent_A[0] * vox_per_A > W) or (extent_A[1] * vox_per_A > H):
+                margin = 0.92
+                sxy = min((W * margin) / extent_A[0], (H * margin) / extent_A[1])
+                sz = min(sxy, (D * margin) / max(extent_A[2], 1e-6))
+                scales = np.array([sxy, sxy, sz], dtype=np.float32)
         else:
             s = float(p["scale_factor"])
             scales = np.array([s, s, s], dtype=np.float32)

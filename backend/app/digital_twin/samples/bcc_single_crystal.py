@@ -4,7 +4,7 @@ Body-centered cubic single crystal (e.g. alpha-Fe, W, Mo). Two-atom basis.
 Carries a CrystalLattice so the server can render real kinematical diffraction.
 """
 import numpy as np
-from .base import Sample, SampleMetadata, CrystalLattice
+from .base import Sample, SampleMetadata, CrystalLattice, make_lamella_slab
 from . import register
 
 
@@ -13,7 +13,7 @@ class BCCSingleCrystal(Sample):
     feature_scale_nm = 0.2   # atomic-column spacing (~0.2 nm)
     meta = SampleMetadata(
         name="bcc_single_crystal",
-        display_name="BCC Single Crystal",
+        display_name="Fe (BCC, alpha-ferrite)",
         description="Body-centered cubic single-crystal volume (Fe/W-like).",
         default_params={
             "a_px": 24,
@@ -66,39 +66,14 @@ class BCCSingleCrystal(Sample):
 
     def generate_volume(self, D, H, W):
         p = self.params
-        a_px = int(p["a_px"])
-        V = np.zeros((D, H, W), dtype=np.float32) + float(p["base_level"])
-
-        basis = np.array([
-            [0.0, 0.0, 0.0],
-            [0.5, 0.5, 0.5],
-        ], dtype=np.float32)
-
-        nz = int(np.ceil(D / a_px)) + 2
-        ny = int(np.ceil(H / a_px)) + 2
-        nx = int(np.ceil(W / a_px)) + 2
-
-        for iz in range(nz):
-            for iy in range(ny):
-                for ix in range(nx):
-                    cell = np.array([iz, iy, ix], dtype=np.float32) * a_px
-                    for b in basis:
-                        pos = cell + b * a_px
-                        z = int(round(pos[0]))
-                        y = int(round(pos[1]))
-                        x = int(round(pos[2]))
-                        if 0 <= z < D and 0 <= y < H and 0 <= x < W:
-                            V[z, y, x] += float(p["atom_intensity"])
-
-        def gfreq(n, s):
-            f = np.fft.fftfreq(n).astype(np.float32)
-            return np.exp(-2.0 * (np.pi ** 2) * (s ** 2) * (f ** 2)).astype(np.float32)
-
-        s = float(p["sigma_px"])
-        gz, gy, gx = gfreq(D, s), gfreq(H, s), gfreq(W, s)
-        F = np.fft.fftn(V)
-        F *= gz[:, None, None]
-        F *= gy[None, :, None]
-        F *= gx[None, None, :]
-        Vb = np.fft.ifftn(F).real.astype(np.float32)
-        return np.clip(Vb, 0, 65535).astype(np.float32)
+        # A single crystal is a roughly uniform slab in HAADF at these scales;
+        # the crystallinity is in the diffraction (get_atoms_in_region). Render
+        # the lamella footprint in vacuum (see make_lamella_slab).
+        return make_lamella_slab(
+            D, H, W,
+            generation_range_um=self.generation_range_um,
+            sample_length_um=self.sample_length_um,
+            sample_width_um=self.sample_width_um,
+            base_level=float(p.get("base_level", 90.0)),
+            slab_level=40000.0,
+            texture=0.05, seed=1)
