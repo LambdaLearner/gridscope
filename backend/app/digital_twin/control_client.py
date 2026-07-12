@@ -71,7 +71,12 @@ class MicroscopeControlClient:
         import time
         deadline = time.time() + timeout
         while time.time() < deadline:
-            r = self.is_ready()
+            try:
+                r = self.is_ready()
+            except OSError:
+                # Server not listening yet (still booting) — keep waiting.
+                time.sleep(poll)
+                continue
             if r.get("error"): raise RuntimeError("Server init failed:\n" + r["error"])
             if r.get("ready"): return r
             time.sleep(poll)
