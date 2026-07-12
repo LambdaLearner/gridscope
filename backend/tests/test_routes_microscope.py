@@ -80,6 +80,14 @@ class FakeControl:
     def device_settings(self, device, **kw):
         return 1
 
+    def get_diffraction_settings(self):
+        return {"camera_length_mm": 800.0, "beamstop_radius_px": 6.0,
+                "thickness_nm": 20.0, "aperture_um": 0.4, "depth_nm": 20.0,
+                "use_local_atoms": 1.0}
+
+    def set_diffraction_settings(self, **kw):
+        return {**self.get_diffraction_settings(), **kw}
+
     def get_resolution(self, device="haadf"):
         return {"resolution_px": 512, "allowed": [512, 1024, 2048]}
 
@@ -219,6 +227,29 @@ class TestAcquireAndAutofocus:
         r = client.post("/api/microscope/autofocus", json={})
         assert r.status_code == 200
         assert r.json()["result"]["converged"] is False
+
+
+class TestDiffractionSettings:
+    def test_get_diffraction_settings(self, client):
+        r = client.get("/api/microscope/diffraction")
+        assert r.status_code == 200
+        assert r.json()["camera_length_mm"] == 800.0
+
+    def test_set_diffraction_settings(self, client):
+        r = client.post("/api/microscope/diffraction",
+                        json={"aperture_um": 0.4, "camera_length_mm": 1200.0})
+        assert r.status_code == 200
+        assert r.json()["camera_length_mm"] == 1200.0
+
+    @pytest.mark.parametrize("payload", [
+        {"camera_length_mm": 0.0},
+        {"beamstop_radius_px": -1.0},
+        {"aperture_um": 500.0},
+        {"depth_nm": -5.0},
+    ])
+    def test_diffraction_validation_is_422(self, client, payload):
+        r = client.post("/api/microscope/diffraction", json=payload)
+        assert r.status_code == 422
 
 
 class TestResolutionAndSpectrum:

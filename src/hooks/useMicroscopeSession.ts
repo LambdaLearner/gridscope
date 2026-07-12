@@ -21,15 +21,23 @@ export interface UseMicroscopeSessionReturn {
 export function useMicroscopeSession(intervalMs = 2000): UseMicroscopeSessionReturn {
   const [session, setSession] = useState<SessionSnapshot | null>(null);
   const inFlight = useRef(false);
+  const failures = useRef(0);
 
   const refresh = useCallback(async () => {
     if (inFlight.current) return;
     inFlight.current = true;
     try {
       const snapshot = await getSession();
+      failures.current = 0;
       setSession(snapshot);
     } catch {
-      setSession((prev) => (prev ? { ...prev, connected: false } : null));
+      // The twin serves acquisitions serially, so a poll can fail or stall
+      // while a long frame renders. One miss means "busy", not "disconnected";
+      // only consecutive misses flip the indicator.
+      failures.current += 1;
+      if (failures.current >= 2) {
+        setSession((prev) => (prev ? { ...prev, connected: false } : null));
+      }
     } finally {
       inFlight.current = false;
     }

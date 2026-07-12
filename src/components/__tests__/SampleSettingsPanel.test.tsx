@@ -14,7 +14,15 @@ vi.mock('../../api/simulation', () => ({
   registerSample: vi.fn(),
   setEnvironment: vi.fn(),
   resetSpecimen: vi.fn(),
+  setThickness: vi.fn(),
+  setDrift: vi.fn(),
+  setSpecimen: vi.fn(),
 }));
+
+vi.mock('../../api/digitalTwin', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../api/digitalTwin')>();
+  return { ...original, setDetectorSettings: vi.fn() };
+});
 
 const REGISTRY = {
   samples: [
@@ -53,6 +61,7 @@ beforeEach(() => {
     registered: 'fcc_single_crystal',
     shape: [16, 96, 96],
     params: {},
+    thickness: { total_nm: 100, working_nm: 100, z_start_nm: 0, seed: 0 },
     environment: 'pristine',
   });
 });
@@ -104,12 +113,16 @@ describe('SampleSettingsPanel', () => {
     );
     await waitFor(() => expect(screen.getByText('FCC single crystal')).toBeTruthy());
 
-    fireEvent.click(screen.getByRole('button', { name: /Register sample/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Register \/ Load sample/i }));
     await waitFor(() => {
       expect(simulation.registerSample).toHaveBeenCalledWith(
         'fcc_single_crystal',
-        {},
-        'pristine',
+        expect.objectContaining({
+          params: {},
+          environment: 'pristine',
+          thickness_nm: 100,
+          thickness_seed: 0,
+        }),
       );
       expect(onRegistered).toHaveBeenCalled();
     });
@@ -128,7 +141,7 @@ describe('SampleSettingsPanel', () => {
       />,
     );
     await waitFor(() => expect(screen.getByText('FCC single crystal')).toBeTruthy());
-    fireEvent.click(screen.getByRole('button', { name: /Register sample/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Register \/ Load sample/i }));
     await waitFor(() => {
       expect(screen.getByText(/Registration failed|file not found/)).toBeTruthy();
     });

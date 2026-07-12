@@ -8,6 +8,18 @@
 
 import { apiGet, apiPost } from './client';
 
+// Magnification <-> field-of-view calibration: mag = MAG_K / fov_metres.
+// Same constant as the twin server (57 kx <-> 1.6564523008 µm).
+export const MAG_K = 0.0944177811456;
+
+export function fovUmToMag(fovUm: number): number {
+  return MAG_K / (fovUm * 1e-6);
+}
+
+export function magToFovUm(mag: number): number {
+  return (MAG_K / mag) * 1e6;
+}
+
 // ===== Types =====
 
 export interface StageLimits {
@@ -41,18 +53,58 @@ export interface SampleStatus {
   registered: boolean;
 }
 
+export interface ThicknessState {
+  total_nm: number;
+  working_nm: number;
+  z_start_nm: number;
+  seed: number;
+}
+
+export interface ResolutionInfo {
+  resolution_px: number;
+  allowed: number[];
+}
+
 export interface MicroscopeState {
   stage: { x: number; y: number; z: number; a: number; b: number };
   beam: BeamSettings;
   vacuum: number;
   status: string;
   holder_type: string;
-  mode: string; // "IMG" | "DIFF"
+  mode: string; // "IMG" | "DIFF" | "EELS"
   detectors: { [device: string]: DetectorSettings };
   diffraction: { [key: string]: number };
   environment: string;
   sample: SampleStatus;
   stage_limits: StageLimits;
+  thickness?: ThicknessState;
+  resolution?: ResolutionInfo;
+}
+
+export interface SpectrumEdge {
+  label: string;
+  onset_ev: number;
+  Z: number;
+}
+
+export interface SpectrumResult {
+  success: boolean;
+  energy_ev: number[];
+  intensity: number[];
+  edges: SpectrumEdge[];
+  zlp_ev: number;
+  plasmon_ev: number;
+  thickness_nm: number;
+  elements_Z: number[];
+}
+
+export interface DiffractionSettingsInfo {
+  camera_length_mm: number;
+  beamstop_radius_px: number;
+  thickness_nm: number;
+  aperture_um: number;
+  depth_nm: number;
+  use_local_atoms: number;
 }
 
 export interface CommandLogEntry {
@@ -176,8 +228,42 @@ export function runAutofocus(
   return apiPost('/microscope/autofocus', { device, z_range_um, z_steps });
 }
 
-export function setMode(mode: 'IMG' | 'DIFF'): Promise<{ success: boolean; mode: string }> {
+export function setMode(mode: 'IMG' | 'DIFF' | 'EELS'): Promise<{ success: boolean; mode: string }> {
   return apiPost('/microscope/mode', { mode });
+}
+
+export function getResolution(device = 'haadf'): Promise<ResolutionInfo> {
+  return apiGet(`/microscope/resolution?device=${device}`);
+}
+
+/** resolution_px must be one of 512/1024/2048; 2048 frames can take ~30 s. */
+export function setResolution(
+  resolution_px: number,
+  device = 'haadf',
+): Promise<{ success: boolean } & ResolutionInfo> {
+  return apiPost('/microscope/resolution', { resolution_px, device });
+}
+
+/** Single-spot EELS spectrum (structured dummy on the twin). */
+export function acquireSpectrum(options: {
+  ev_min?: number;
+  ev_max?: number;
+  n_channels?: number;
+} = {}): Promise<SpectrumResult> {
+  return apiPost('/microscope/spectrum', options);
+}
+
+export function getDiffractionSettings(): Promise<DiffractionSettingsInfo> {
+  return apiGet('/microscope/diffraction');
+}
+
+export function setDiffractionSettings(settings: {
+  camera_length_mm?: number;
+  beamstop_radius_px?: number;
+  aperture_um?: number;
+  depth_nm?: number;
+}): Promise<{ success: boolean } & DiffractionSettingsInfo> {
+  return apiPost('/microscope/diffraction', settings);
 }
 
 export function setBeamSettings(

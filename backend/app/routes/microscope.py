@@ -78,6 +78,13 @@ class AutofocusRequest(BaseModel):
     z_steps: int = 9
 
 
+class DiffractionSettings(BaseModel):
+    camera_length_mm: Optional[float] = Field(None, gt=0.0, le=10000.0)
+    beamstop_radius_px: Optional[float] = Field(None, ge=0.0, le=64.0)
+    aperture_um: Optional[float] = Field(None, ge=0.0, le=100.0)
+    depth_nm: Optional[float] = Field(None, ge=0.0, le=1000.0)
+
+
 class SetResolutionRequest(BaseModel):
     # The twin (like a real scan generator) offers a fixed set of windows;
     # validating here gives a 422 with the legal values before any RPC.
@@ -245,6 +252,21 @@ def set_detector_settings(device: str, settings: DetectorSettings):
     ts.twin_call(ts.get_control().device_settings, device, **kwargs)
     state = ts.twin_call(ts.get_control().get_microscope_state)
     return {"success": True, "settings": state.get("detectors", {}).get(device)}
+
+
+@router.get("/diffraction")
+def get_diffraction_settings():
+    return ts.twin_call(ts.get_control().get_diffraction_settings)
+
+
+@router.post("/diffraction")
+def set_diffraction_settings(settings: DiffractionSettings):
+    """Kinematical diffraction projection settings (selected-area aperture,
+    probed depth, camera length, beam-stop radius)."""
+    ts.require_idle()
+    kwargs = {k: v for k, v in settings.model_dump().items() if v is not None}
+    result = ts.twin_call(lambda: ts.get_control().set_diffraction_settings(**kwargs))
+    return {"success": True, **result}
 
 
 @router.get("/resolution")
