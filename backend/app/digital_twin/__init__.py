@@ -1,7 +1,17 @@
-"""TEM Digital Twin - Local microscope simulation server and client."""
+"""STEM Digital Twin v6 — simulation server and split clients.
 
-from .tem_client import TEMClient
-from .tem_server import TEMServer, main as start_server
+MicroscopeControlClient — portable instrument control (real-HW counterparts).
+SimulationHarness       — twin-only configuration (sample, environment, drift).
+STEMServer / start_server — the Twisted digital-twin server itself.
+"""
 
-__all__ = ["TEMClient", "TEMServer", "start_server"]
+from .control_client import MicroscopeControlClient
+from .sim_harness import SimulationHarness
+from .server import STEMServer, main as start_server
 
+__all__ = [
+    "MicroscopeControlClient",
+    "SimulationHarness",
+    "STEMServer",
+    "start_server",
+]

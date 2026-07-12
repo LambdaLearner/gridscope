@@ -1,69 +1,47 @@
-import { useState, useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { Microscope } from 'lucide-react';
 import { AIAssistant } from './components/AIAssistant';
-import { MicroscopeViewer } from './components/MicroscopeViewer';
+import { SampleSettingsPanel } from './components/SampleSettingsPanel';
+import { MicroscopeControlsPanel } from './components/MicroscopeControlsPanel';
 import { ExecutionPanel } from './components/ExecutionPanel';
 import { MicroscopeLogsPanel } from './components/MicroscopeLogsPanel';
-import { type MicroscopeState, type AcquireResult } from './api/digitalTwin';
+import { useMicroscopeSession } from './hooks/useMicroscopeSession';
 import { useCodeExecution } from './hooks/useCodeExecution';
-import type { ExecutionPlan } from './types/execution';
 
 function App() {
-  const [isConnected, setIsConnected] = useState(false);
-  const [microscopeState, setMicroscopeState] = useState<MicroscopeState | null>(null);
   const [generatedCode, setGeneratedCode] = useState<string | null>(null);
-  const [currentSampleType, setCurrentSampleType] = useState<string>('au_nanoparticles');
-  const [currentMode, setCurrentMode] = useState<string>('IMG');
-  const [currentPlan, setCurrentPlan] = useState<ExecutionPlan | undefined>(undefined);
+
+  // Single session poller feeding every panel (state, sample, run, log).
+  const { session, connected, sampleRegistered, runActive, refresh } =
+    useMicroscopeSession(2000);
 
   const {
     executionLogs,
     acquiredImages,
     isExecuting,
     handleRunCode,
-  } = useCodeExecution(currentSampleType, currentMode, setCurrentSampleType, setCurrentMode);
+    handleStopExecution,
+  } = useCodeExecution();
 
-  // Handle microscope state updates from viewer
-  const handleMicroscopeStateChange = useCallback((state: MicroscopeState) => {
-    setMicroscopeState(state);
-    setIsConnected(true);
-    if (state.sample_type) {
-      setCurrentSampleType(state.sample_type);
-    }
-    if (state.mode) {
-      setCurrentMode(state.mode);
-    }
-  }, []);
-
-  // Handle image acquisition from viewer (manual acquire button)
-  const handleImageAcquired = useCallback((_result: AcquireResult) => {
-    // Images from the viewer are handled independently by MicroscopeViewer.
-    // The hook manages images from code execution.
-  }, []);
-
-  // Handle code generation
   const handleCodeGenerated = useCallback((code: string) => {
     setGeneratedCode(code);
   }, []);
 
-  // Handle run — passes execution plan if available
-  const handleRunCodeWithPlan = useCallback(async (code: string, executionPlan?: ExecutionPlan) => {
-    // Store the plan for potential re-runs
-    if (executionPlan) setCurrentPlan(executionPlan);
-    await handleRunCode(code, executionPlan);
-  }, [handleRunCode]);
+  const handleRun = useCallback(
+    async (code: string) => {
+      setGeneratedCode(code);
+      await handleRunCode(code);
+      refresh();
+    },
+    [handleRunCode, refresh],
+  );
 
-  // Start execution (from ExecutionPanel button)
   const handleStartExecution = useCallback(() => {
-    if (generatedCode) {
-      handleRunCode(generatedCode, currentPlan);
-    }
-  }, [generatedCode, currentPlan, handleRunCode]);
+    if (generatedCode) handleRun(generatedCode);
+  }, [generatedCode, handleRun]);
 
-  // Stop execution
-  const handleStopExecution = useCallback(() => {
-    // The hook doesn't support abort yet, but we can show intent
-  }, []);
+  const stage = session?.state?.stage;
+  const fovUm = session?.state?.detectors?.haadf?.field_of_view_um;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
@@ -86,17 +64,26 @@ function App() {
             {/* Status indicators */}
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
+                <div className={`w-2 h-2 rounded-full ${connected ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
                 <span className="text-sm text-slate-400">
-                  {isConnected ? 'Connected' : 'Disconnected'}
+                  {connected ? 'Connected' : 'Disconnected'}
                 </span>
               </div>
 
-              {microscopeState && (
+              {connected && (
+                <div className="flex items-center gap-2">
+                  <div className={`w-2 h-2 rounded-full ${sampleRegistered ? 'bg-amber-400' : 'bg-slate-600'}`} />
+                  <span className="text-sm text-slate-400">
+                    {sampleRegistered ? session?.sample?.name : 'No sample'}
+                  </span>
+                </div>
+              )}
+
+              {stage && (
                 <div className="hidden md:flex items-center gap-4 text-xs text-slate-500 font-mono">
-                  <span>X: {(microscopeState.stage.x * 1e6).toFixed(1)} µm</span>
-                  <span>Y: {(microscopeState.stage.y * 1e6).toFixed(1)} µm</span>
-                  <span>FOV: {microscopeState.detectors?.haadf?.field_of_view_um || 20} µm</span>
+                  <span>X: {(stage.x * 1e6).toFixed(1)} µm</span>
+                  <span>Y: {(stage.y * 1e6).toFixed(1)} µm</span>
+                  {fovUm !== undefined && <span>FOV: {fovUm.toFixed(1)} µm</span>}
                 </div>
               )}
             </div>
@@ -106,32 +93,37 @@ function App() {
 
       {/* Main Content */}
       <main className="max-w-[2000px] mx-auto px-6 py-6">
-        <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-
-          {/* Left Column: Microscope Viewer */}
+        <div className="grid grid-cols-1 xl:grid-cols-4 gap-6">
+          {/* Column 1: Sample Settings (simulation-only window) */}
           <div className="xl:col-span-1 space-y-6">
-            <MicroscopeViewer
-              onStateChange={handleMicroscopeStateChange}
-              onImageAcquired={handleImageAcquired}
+            <SampleSettingsPanel
+              session={session}
+              runActive={runActive || isExecuting}
+              onRegistered={refresh}
             />
+            <MicroscopeLogsPanel log={session?.log ?? []} />
+          </div>
 
-            {/* Microscope Command Log */}
-            <MicroscopeLogsPanel
-              autoRefresh={true}
-              refreshInterval={2000}
+          {/* Column 2: Microscope Controls (portable control surface) */}
+          <div className="xl:col-span-1">
+            <MicroscopeControlsPanel
+              session={session}
+              sampleRegistered={sampleRegistered}
+              runActive={runActive || isExecuting}
+              onAcquired={refresh}
             />
           </div>
 
-          {/* Middle Column: AI Assistant */}
+          {/* Column 3: AI Assistant */}
           <div className="xl:col-span-1">
             <AIAssistant
               experimentConfig={null}
               onCodeGenerated={handleCodeGenerated}
-              onRunCode={handleRunCodeWithPlan}
+              onRunCode={handleRun}
             />
           </div>
 
-          {/* Right Column: Execution Output */}
+          {/* Column 4: Execution Output */}
           <div className="xl:col-span-1">
             <ExecutionPanel
               code={generatedCode}
@@ -140,8 +132,7 @@ function App() {
               onStop={handleStopExecution}
               logs={executionLogs}
               acquiredImages={acquiredImages}
-              currentSampleType={currentSampleType}
-              currentMode={currentMode}
+              currentSampleType={session?.sample?.name ?? ''}
             />
           </div>
         </div>

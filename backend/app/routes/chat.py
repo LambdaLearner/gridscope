@@ -1,34 +1,12 @@
 """Chat API endpoints for the LLM microscopy assistant."""
 
-import json
 import os
-import re
 from fastapi import APIRouter, HTTPException
-from ..models.schemas import ChatRequest, ChatResponse, ChatMessage, ExecutionPlan
+from ..models.schemas import ChatRequest, ChatResponse, ChatMessage
+from ..services.code_generator import ensure_self_contained
 from ..services.llm_agent import LLMAgent
 
 router = APIRouter(prefix="/chat", tags=["chat"])
-
-
-def _extract_execution_plan(text: str) -> ExecutionPlan | None:
-    """Extract a ```json execution plan block from LLM response text.
-
-    Returns None on parse failure (graceful fallback).
-    """
-    # Find ```json blocks
-    for match in re.finditer(r"```json\s*\n(.*?)```", text, re.DOTALL):
-        raw = match.group(1).strip()
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        # Must look like an execution plan (has plan_type and steps)
-        if isinstance(data, dict) and "plan_type" in data and "steps" in data:
-            try:
-                return ExecutionPlan(**data)
-            except Exception:
-                continue
-    return None
 
 
 def get_agent() -> LLMAgent:
@@ -61,20 +39,20 @@ async def chat(request: ChatRequest) -> ChatResponse:
             additional_context=request.context,
         )
         
-        # Parse response for suggested actions, code blocks, and execution plans
+        # Parse response for suggested actions and code blocks
         suggested_actions = []
         generated_code = None
-        execution_plan = None
 
         # Check if response contains code
         if "```python" in response_text:
             code_start = response_text.find("```python") + 9
             code_end = response_text.find("```", code_start)
             if code_end > code_start:
-                generated_code = response_text[code_start:code_end].strip()
-
-        # Extract execution plan JSON block
-        execution_plan = _extract_execution_plan(response_text)
+                # Prepend the control client + report helper so the script is
+                # runnable as-is by the sandboxed executor.
+                generated_code = ensure_self_contained(
+                    response_text[code_start:code_end].strip()
+                )
 
         # Look for action suggestions
         action_keywords = [
@@ -96,7 +74,6 @@ async def chat(request: ChatRequest) -> ChatResponse:
             suggested_actions=suggested_actions[:5],
             generated_code=generated_code,
             explanation=None,
-            execution_plan=execution_plan,
         )
         
     except ValueError as e:

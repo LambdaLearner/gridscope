@@ -1,197 +1,96 @@
 /**
- * API client for executing code on the STEM Digital Twin
+ * API client for server-side script execution (/api/execute).
+ *
+ * The generated Python runs in a sandboxed subprocess on the backend — the
+ * exact script a user would deploy on a real instrument. Events stream back
+ * over SSE: logs, acquired frames (via the image-marker protocol), errors,
+ * and a final done event.
  */
 
-const API_BASE_URL = 'http://localhost:8000/api/execute';
+import { API_BASE_URL, ApiError } from './client';
 
-export interface ExecuteOperation {
-  operation: string;
-  params?: Record<string, unknown>;
+export interface RunLogEvent { type: 'log'; message: string }
+export interface RunErrorEvent { type: 'error'; message: string }
+export interface RunImageEvent {
+  type: 'image';
+  image: { image_base64: string; width: number; height: number; dtype: string };
+  meta: Record<string, unknown>;
+}
+export interface RunDoneEvent {
+  type: 'done';
+  exit_code: number;
+  elapsed_s: number;
+  images: number;
+}
+export type RunEvent = RunLogEvent | RunErrorEvent | RunImageEvent | RunDoneEvent;
+
+export interface RunStatus {
+  active: boolean;
+  started_at: number | null;
+  label: string | null;
 }
 
-export interface ExecuteResult {
-  operation: string;
-  success: boolean;
-  error?: string;
-  image?: {
-    image_base64: string;
-    width: number;
-    height: number;
-  };
-  stage?: {
-    x_um: number;
-    y_um: number;
-    z_um: number;
-  };
-  result?: unknown;
-  settings?: unknown;
-  state?: unknown;
-}
-
-export interface SimpleExecuteParams {
-  action: 'acquire' | 'move' | 'tilt' | 'autofocus' | 'scan_grid';
-  params?: Record<string, unknown>;
-}
-
-export interface AcquireResult {
-  success: boolean;
-  action: string;
-  image?: {
-    image_base64: string;
-    width: number;
-    height: number;
-  };
-  stage?: {
-    x_um: number;
-    y_um: number;
-    z_um: number;
-  };
-}
-
-export interface MoveResult {
-  success: boolean;
-  action: string;
-  stage: {
-    x_um: number;
-    y_um: number;
-    z_um: number;
-  };
-}
-
-export interface AutofocusResult {
-  success: boolean;
-  action: string;
-  result: {
-    best_z_m: number;
-    best_z_um_relative: number;
-    scores: [number, number][];
-  };
-}
-
-export interface ScanGridResult {
-  success: boolean;
-  action: string;
-  images: {
-    tile_index: number;
-    x_um: number;
-    y_um: number;
-    image: {
-      image_base64: string;
-      width: number;
-      height: number;
-    };
-  }[];
-  logs: string[];
-  total_tiles: number;
-}
-
-/**
- * Execute a sequence of operations
- */
-export async function executeOperations(
-  operations: ExecuteOperation[]
-): Promise<{ results: ExecuteResult[] }> {
-  const response = await fetch(`${API_BASE_URL}/run`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ operations }),
-  });
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
-    throw new Error(error.detail || 'Execution failed');
-  }
-
+export async function getRunStatus(): Promise<RunStatus> {
+  const response = await fetch(`${API_BASE_URL}/execute/status`);
+  if (!response.ok) throw new ApiError(response.status, 'Failed to get run status');
   return response.json();
 }
 
 /**
- * Execute a simple action
+ * Run a script, invoking `onEvent` for each streamed event.
+ * Resolves when the stream ends; rejects with ApiError on start failure
+ * (409 = a run is already active). Abort via the optional AbortSignal.
  */
-export async function executeSimple<T = unknown>(
-  action: SimpleExecuteParams['action'],
-  params: Record<string, unknown> = {}
-): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}/simple`, {
+export async function runScript(
+  code: string,
+  onEvent: (event: RunEvent) => void,
+  options: { timeoutS?: number; label?: string; signal?: AbortSignal } = {},
+): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/execute/run`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action, params }),
+    body: JSON.stringify({
+      code,
+      timeout_s: options.timeoutS ?? 300,
+      label: options.label ?? null,
+    }),
+    signal: options.signal,
   });
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
-    throw new Error(error.detail || 'Execution failed');
+  if (!response.ok || !response.body) {
+    let detail = `Run failed to start (${response.status})`;
+    try {
+      const body = await response.json();
+      if (typeof body.detail === 'string') detail = body.detail;
+    } catch {
+      // keep generic detail
+    }
+    throw new ApiError(response.status, detail);
   }
 
-  return response.json();
-}
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
 
-/**
- * Acquire a single image
- */
-export async function acquireImage(fov_um?: number): Promise<AcquireResult> {
-  return executeSimple('acquire', fov_um ? { fov_um } : {});
-}
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
 
-/**
- * Move the stage
- */
-export async function moveStage(
-  x_um: number,
-  y_um: number,
-  relative: boolean = true
-): Promise<MoveResult> {
-  return executeSimple('move', { x_um, y_um, relative });
+    // SSE frames are separated by a blank line.
+    let sep: number;
+    while ((sep = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          onEvent(JSON.parse(line.slice(6)) as RunEvent);
+        } catch {
+          // Malformed frame — surface rather than swallow.
+          onEvent({ type: 'error', message: 'Received malformed event from server' });
+        }
+      }
+    }
+  }
 }
-
-/**
- * Run autofocus
- */
-export async function runAutofocus(
-  z_range_um: number = 4.0,
-  z_steps: number = 9
-): Promise<AutofocusResult> {
-  return executeSimple('autofocus', { z_range_um, z_steps });
-}
-
-export interface TiltResult {
-  success: boolean;
-  action: string;
-  new_position: {
-    x_um: number;
-    y_um: number;
-    z_um: number;
-    a: number;
-    b: number;
-  };
-}
-
-/**
- * Set stage tilt angles
- */
-export async function tiltStage(
-  a?: number,
-  b?: number,
-  relative: boolean = false
-): Promise<TiltResult> {
-  const params: Record<string, unknown> = { relative };
-  if (a !== undefined) params.a = a;
-  if (b !== undefined) params.b = b;
-  return executeSimple('tilt', params);
-}
-
-/**
- * Scan a grid
- */
-export async function scanGrid(params: {
-  rows: number;
-  cols: number;
-  step_um: number;
-  start_x_um?: number;
-  start_y_um?: number;
-  autofocus?: boolean;
-  fov_um?: number;
-}): Promise<ScanGridResult> {
-  return executeSimple('scan_grid', params);
-}
-

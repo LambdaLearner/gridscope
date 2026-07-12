@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Run the TEM Digital Twin Server separately.
+Run the STEM Digital Twin server (v6) separately.
 
-This starts the Twisted-based TEM Digital Twin server that simulates
-a real microscope with a gold nanoparticle sample.
+Starts the Twisted-based digital twin. The server boots with NO sample
+registered: register one via the GridScope Sample Settings window (or a
+SimulationHarness client) before imaging.
 
 Usage:
     python run_digital_twin.py
 
-The server will be available on port 9094.
+The server listens on port 9094 (JSON-RPC over netstrings).
 """
 
 import sys
@@ -17,22 +18,21 @@ import os
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app.digital_twin.tem_server import main
+from app.digital_twin.server import main
 
 if __name__ == "__main__":
     print("""
 ╔══════════════════════════════════════════════════════════╗
-║          TEM Digital Twin Server                          ║
+║          STEM Digital Twin Server (v6)                    ║
 ║      Simulated Microscope for GridScope                   ║
 ╠══════════════════════════════════════════════════════════╣
-║  Features:                                                ║
-║  • 10,000×10,000 synthetic gold nanoparticle sample      ║
-║  • Subpixel bilinear sampling for smooth motion          ║
-║  • FOV zoom control                                       ║
-║  • Defocus blur + autofocus                              ║
-║  • JSON-RPC over netstring protocol                      ║
+║  • 13-sample registry (crystals, polycrystal, amorphous,  ║
+║    dislocations, Au nanoparticles, core-shell, ...)       ║
+║  • Unified diffraction from atomic positions              ║
+║  • Simulation environments (drift, damage, contamination) ║
+║  • Stage safety limits (soft interlock)                   ║
+║  • JSON-RPC over netstring protocol                       ║
 ╚══════════════════════════════════════════════════════════╝
     """)
-    
-    main(host="127.0.0.1", port=9094)
 
+    main(host="127.0.0.1", port=9094)

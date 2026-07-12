@@ -4,75 +4,33 @@
 
 ---
 
-## MCP Integration (Model Context Protocol)
-
-GridScope exposes the STEM Digital Twin as an **MCP server**, enabling AI assistants like Claude Desktop to directly control the microscope through natural conversation.
-
-### Setup
-
-```bash
-# Install FastMCP
-pip install fastmcp
-
-# Start the Digital Twin server first
-cd backend && python run_digital_twin.py
-
-# In another terminal, start the MCP server
-cd MCP_Code && python hackathon_mcp_tem_client_2.py
-```
-
-The MCP server runs on `http://127.0.0.1:8081` using SSE transport.
-
-### Available MCP Tools
-
-| Tool | Description |
-|------|-------------|
-| `get_detectors()` | List available detectors |
-| `get_stage()` | Get current stage position |
-| `set_stage(x, y, relative)` | Move stage (x, y in meters) |
-| `get_beam()` | Get beam position |
-| `set_beam(x, y, relative)` | Set beam position |
-| `get_mode()` | Get microscope mode (IMG/DIFF) |
-| `set_mode(mode)` | Set microscope mode |
-| `acquire_image(device)` | Capture image from detector |
-| `autofocus(device, z_range_um, z_steps)` | Run autofocus routine |
-| `get_diffraction_settings()` | Get diffraction parameters |
-
-### Claude Desktop Configuration
-
-Add to your Claude Desktop config (`claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "gridscope-stem": {
-      "url": "http://127.0.0.1:8081/sse"
-    }
-  }
-}
-```
-
-Once configured, you can ask Claude to directly control the microscope:
-- *"Move the stage 5 micrometers to the right and acquire an image"*
-- *"Run autofocus and then take a diffraction pattern"*
-- *"What is the current stage position?"*
-
----
-
 ## Overview
 
-GridScope is an AI-powered automation platform for Scanning Transmission Electron Microscopy (STEM) that bridges the gap between experimental design and instrument execution. Researchers describe imaging objectives in natural language—such as *"acquire a 5×5 grid at 3 µm spacing"* or *"explore tilt angles from 0° to 60°"*—and receive executable Python scripts validated against a physics-based Digital Twin.
+GridScope is an AI-powered automation platform for Scanning Transmission Electron Microscopy (STEM) that bridges the gap between experimental design and instrument execution. Researchers describe imaging objectives in natural language—such as *"acquire a 5×5 grid at 3 µm spacing"* or *"explore tilt angles from 0° to 30°"*—and receive executable Python scripts validated against a physics-based Digital Twin (v6, ported from `STEM_Digital_Twin_Modular_final_w_PyJEM.ipynb`).
+
+### The control / simulation split
+
+The system keeps two surfaces strictly apart, so what you test here deploys there:
+
+- **Microscope control** (`/api/microscope`, `MicroscopeControlClient`) — every
+  operation has a real-instrument counterpart: stage (with soft safety limits),
+  beam, imaging/diffraction mode, magnification↔FOV, detectors, acquisition,
+  autofocus. Generated scripts use **only** this surface.
+- **Simulation** (`/api/simulation`, `SimulationHarness`) — twin-only test
+  scaffolding with no real-HW equivalent: the sample registry and registration,
+  simulation environments, drift, beam damage, and contamination.
 
 ### Key Features
 
 | Feature | Description |
 |---------|-------------|
 | **Natural Language Interface** | Describe experiments in plain English, get executable code |
-| **STEM Digital Twin** | Physics-based simulator with 3D samples, tilt, and diffraction |
-| **Multiple Samples** | Gold nanoparticles and FCC single crystal |
-| **Imaging & Diffraction Modes** | Switch between real-space imaging and FFT-based diffraction |
-| **Tilt Series** | α/β stage tilt from -60° to +60° for 3D exploration |
-| **Live Execution** | Run generated scripts directly on the Digital Twin |
+| **STEM Digital Twin (v6)** | Unified diffraction from atomic positions; specimen realism |
+| **13-Sample Registry** | Crystals (FCC/BCC/HCP), polycrystals, dislocations, amorphous films, Au nanoparticle variants, core-shell, shape assemblies |
+| **Sample Registration** | Register a sample before imaging — like inserting a holder |
+| **Simulation Environments** | `pristine`, `beam_sensitive`, `contaminating`, `thick_drifting`, `low_dose` |
+| **Stage Safety Limits** | ±1.5 mm (x/y), ±1 mm (z), ±30° (tilt); out-of-range moves rejected |
+| **Sandboxed Execution** | Generated scripts run server-side in a subprocess — the exact code you would deploy |
 
 ---
 
@@ -82,7 +40,7 @@ GridScope is an AI-powered automation platform for Scanning Transmission Electro
 
 - Node.js ≥ 18.x
 - Python ≥ 3.10
-- OpenAI API Key
+- OpenAI API Key (optional — template generation works without it)
 
 ### Installation
 
@@ -122,72 +80,73 @@ Access the application at `http://localhost:5173`
 
 ---
 
-
 ### Components
 
 | Component | Technology | Purpose |
 |-----------|------------|---------|
-| Frontend | React, TypeScript, Tailwind | Microscope UI, AI chat, execution panel |
-| Backend | FastAPI, Python | API routing, LLM orchestration |
-| Digital Twin | Twisted JSON-RPC | STEM physics simulation |
-| AI Agent | OpenAI GPT-4 | Natural language to Python code |
+| Frontend | React, TypeScript, Tailwind | Sample settings, microscope controls, AI chat, execution panel |
+| Backend | FastAPI, Python | Control/simulation routing, sandboxed script runner, LLM orchestration |
+| Digital Twin | Twisted JSON-RPC (`backend/app/digital_twin/`) | STEM physics simulation (v6) |
+| AI Agent | OpenAI GPT-4 | Natural language to portable Python code |
 
 ---
 
 ## Usage
 
-### 1. Microscope Control (Left Panel)
+### 1. Sample Settings (first window)
 
-- **Mode Toggle**: Switch between Imaging and Diffraction
-- **Sample Selection**: Au Nanoparticles or FCC Crystal
-- **Stage Control**: X/Y movement with configurable step size
-- **Tilt Control**: α/β angles for 3D projection
-- **Beam Settings**: Voltage (60-300 kV) and Current (5-200 pA)
+Simulation-only configuration — nothing here exists on a real instrument:
 
-### 2. AI Assistant (Center Panel)
+- **Sample registry**: pick one of 13 samples (descriptions from the server)
+- **Register**: builds the specimen volume and resets degradation history.
+  The microscope is disabled until a sample is registered.
+- **Environment**: bundle of realism settings (drift, damage, contamination, dose)
+- **Fresh specimen**: clear accumulated beam damage / contamination
+
+### 2. Microscope Controls (second window)
+
+The portable control surface — every action maps to a real instrument:
+
+- **Mode Toggle**: Imaging ↔ Diffraction (diffraction is computed from atoms; 1–5 s/frame)
+- **Stage Control**: X/Y moves; rejected moves show the twin's safety-limit message
+- **Tilt Control**: α/β within ±30°
+- **Field of View / Magnification**: coupled controls (mag = k / FOV)
+- **Beam Settings**: Voltage (60–300 kV) and Current (5–200 pA)
+- **Autofocus**: can legitimately fail to converge — the UI reports why
+
+### 3. AI Assistant + Execution Output
 
 Enter natural language prompts:
 
 ```
 "Take a 5x5 grid of images spaced 3 micrometers apart"
-"Explore different a and b values from 0 to 60 with step 10"
-"Acquire images in diffraction mode at various defocus levels"
+"Tilt from 0 to 20 degrees in steps of 5 and acquire at each angle"
+"Switch to diffraction mode and acquire a pattern"
 ```
 
-### 3. Execution Output (Right Panel)
-
-- View generated Python code
-- Run scripts on the Digital Twin
-- Monitor execution progress
-- Browse acquired images with metadata
+Generated scripts embed only `MicroscopeControlClient` and run **server-side
+in a sandboxed subprocess** — logs and acquired frames stream live into the
+execution panel. One run at a time: UI controls are read-only while a script
+owns the instrument.
 
 ---
 
-## Digital Twin Capabilities
+## Digital Twin Capabilities (v6)
 
-### Samples
-
-| Sample | Description |
-|--------|-------------|
-| **Au Nanoparticles** | 2048×2048×72 voxel volume, ~1200 random particles |
-| **FCC Single Crystal** | 768×768×64 voxel periodic lattice (a=24 px) |
-
-### Imaging Modes
-
-| Mode | Output |
-|------|--------|
-| **Imaging (IMG)** | Real-space STEM projection with tilt |
-| **Diffraction (DIFF)** | FFT-based diffraction pattern |
+- Diffraction computed directly from atomic positions in the illuminated
+  region (crystals → spots, polycrystals → rings, amorphous → diffuse halos)
+- Poisson-dose noise model, probe PSF with defocus and aberrations
+- Mechanical drift (between- and intra-frame), beam damage, contamination
+- Inherent length scales: raise magnification to resolve each sample's features
+- Stage soft limits enforced server-side; a rejected move does not move the stage
 
 ### Stage Parameters
 
 | Parameter | Range | Units |
 |-----------|-------|-------|
-| X, Y position | ±100 | µm |
-| Z (focus) | ±10 | µm |
-| α (alpha tilt) | ±60 | degrees |
-| β (beta tilt) | ±60 | degrees |
-
+| X, Y position | ±1.5 | mm |
+| Z (focus) | ±1.0 | mm |
+| α, β (tilt) | ±30 | degrees |
 
 ---
 
@@ -195,12 +154,29 @@ Enter natural language prompts:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/microscope/status` | GET | Connection status |
-| `/api/microscope/acquire` | POST | Acquire image |
-| `/api/microscope/stage` | POST | Set stage/tilt |
-| `/api/execute/simple` | POST | Execute actions |
+| `/api/microscope/session` | GET | Polled snapshot: state + sample + run + log |
+| `/api/microscope/limits` | GET | Stage soft limits |
+| `/api/microscope/stage` | GET/POST | Stage position (400 on limit rejection) |
+| `/api/microscope/acquire` | POST | Acquire frame (IMG/DIFF) |
+| `/api/microscope/autofocus` | POST | Autofocus (reports `converged`) |
+| `/api/simulation/samples` | GET | Sample registry |
+| `/api/simulation/sample/register` | POST | Register the active sample |
+| `/api/simulation/environment` | GET/POST | Simulation environment |
+| `/api/execute/run` | POST | Run a script sandboxed (SSE stream) |
 | `/api/chat` | POST | AI assistant |
-| `/api/code/generate` | POST | Generate Python code |
+| `/api/code/generate` | POST | Generate portable Python code |
 
 ---
 
+## Tests
+
+```bash
+# Backend (twin physics, routes, sandbox runner, spec-drift guards)
+cd backend && venv/bin/python -m pytest
+
+# Frontend (API error parsing, both windows, SSE client)
+npm test -- --run
+
+# Types
+npm run typecheck
+```

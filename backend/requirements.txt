@@ -1,1 +1,17 @@
+# GridScope backend — API server + STEM Digital Twin (v6)
+fastapi>=0.109
+uvicorn>=0.27
+pydantic>=2.5
+python-dotenv>=1.0
+openai>=1.12
 
+# Digital twin
+twisted>=24.0
+numpy>=1.26
+scipy>=1.11
+ase>=3.22
+pillow>=10.0
+
+# Tests
+pytest>=8.0
+httpx>=0.26
