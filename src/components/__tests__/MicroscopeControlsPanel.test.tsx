@@ -16,11 +16,23 @@ vi.mock('../../api/digitalTwin', async (importOriginal) => {
   return {
     ...original,
     acquireImage: vi.fn(),
+    acquireSpectrum: vi.fn(),
     runAutofocus: vi.fn(),
     setStagePosition: vi.fn(),
     setDetectorSettings: vi.fn(),
+    setDiffractionSettings: vi.fn(),
     setMode: vi.fn(),
     setBeamSettings: vi.fn(),
+    setResolution: vi.fn(),
+  };
+});
+
+vi.mock('../../api/simulation', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../api/simulation')>();
+  return {
+    ...original,
+    getAbtemAvailability: vi.fn().mockResolvedValue({ available: true, detail: null }),
+    computeAbtemDiffraction: vi.fn(),
   };
 });
 
@@ -58,6 +70,7 @@ const UNREGISTERED: SessionSnapshot = {
 };
 
 beforeEach(() => {
+  vi.clearAllMocks();
   vi.mocked(twin.acquireImage).mockResolvedValue({
     success: true,
     device: 'haadf',
@@ -171,5 +184,125 @@ describe('MicroscopeControlsPanel', () => {
       expect(twin.acquireImage).toHaveBeenCalledWith('haadf');
       expect(screen.getByAltText('Microscope view')).toBeTruthy();
     });
+  });
+});
+
+describe('MicroscopeControlsPanel — v6+ features', () => {
+  const DIFF_SESSION: SessionSnapshot = {
+    ...SESSION,
+    state: { ...SESSION.state!, mode: 'DIFF' },
+  };
+
+  it('offers all three modes including EELS', () => {
+    render(
+      <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    expect(screen.getByRole('button', { name: /Imaging/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Diffraction/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /EELS/i })).toBeTruthy();
+  });
+
+  it('renders the discrete resolution windows from the session state', () => {
+    const withRes: SessionSnapshot = {
+      ...SESSION,
+      state: {
+        ...SESSION.state!,
+        resolution: { resolution_px: 512, allowed: [512, 1024, 2048] },
+      },
+    };
+    render(
+      <MicroscopeControlsPanel session={withRes} sampleRegistered={true} runActive={false} />,
+    );
+    expect(screen.getByRole('button', { name: /^512$/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /1024/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /2048/ })).toBeTruthy();
+  });
+
+  it('changes resolution through the control API', async () => {
+    vi.mocked(twin.setResolution).mockResolvedValue({
+      success: true, resolution_px: 1024, allowed: [512, 1024, 2048],
+    });
+    render(
+      <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /1024/ }));
+    await waitFor(() => expect(twin.setResolution).toHaveBeenCalledWith(1024));
+  });
+
+  it('shows the kinematical⇄abTEM engine toggle in DIFF mode', async () => {
+    render(
+      <MicroscopeControlsPanel session={DIFF_SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Kinematical/i })).toBeTruthy();
+      expect(screen.getByRole('button', { name: /abTEM/i })).toBeTruthy();
+    });
+  });
+
+  it('greys the abTEM toggle when the backend reports it unavailable', async () => {
+    const sim = await import('../../api/simulation');
+    vi.mocked(sim.getAbtemAvailability).mockResolvedValue({
+      available: false,
+      detail: 'The dynamical-diffraction engine requires `abtem` and `ase`.',
+    });
+    render(
+      <MicroscopeControlsPanel session={DIFF_SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    await waitFor(() => {
+      const toggle = screen.getByRole('button', { name: /abTEM/i }) as HTMLButtonElement;
+      expect(toggle.disabled).toBe(true);
+      expect(toggle.title).toMatch(/not installed/i);
+    });
+  });
+
+  it('computes a dynamical pattern via the explicit button (never auto)', async () => {
+    const sim = await import('../../api/simulation');
+    vi.mocked(sim.getAbtemAvailability).mockResolvedValue({ available: true, detail: null });
+    vi.mocked(sim.computeAbtemDiffraction).mockResolvedValue({
+      success: true,
+      engine: 'abtem',
+      image: { image_base64: 'aW1n', width: 256, height: 256, dtype: 'uint16' },
+      state: {
+        sample: 'fcc_single_crystal', params: {}, tilt_a_deg: 0, tilt_b_deg: 0,
+        energy_kev: 200, num_frozen_phonons: 0,
+      },
+      fingerprint: 'abc123', n_atoms: 5000, compute_seconds: 3.2, cached: false,
+    });
+    render(
+      <MicroscopeControlsPanel session={DIFF_SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    await waitFor(() => screen.getByRole('button', { name: /abTEM/i }));
+    fireEvent.click(screen.getByRole('button', { name: /abTEM/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Compute dynamical pattern/i }));
+    await waitFor(() => {
+      expect(sim.computeAbtemDiffraction).toHaveBeenCalledWith({ num_frozen_phonons: 0 });
+      expect(screen.getByText(/abTEM · 5,000 atoms/)).toBeTruthy();
+    });
+  });
+
+  it('acquires an EELS spectrum in EELS mode and plots it', async () => {
+    const eelsSession: SessionSnapshot = {
+      ...SESSION,
+      state: { ...SESSION.state!, mode: 'EELS' },
+    };
+    vi.mocked(twin.acquireSpectrum).mockResolvedValue({
+      success: true,
+      energy_ev: [0, 500, 1000],
+      intensity: [1, 0.2, 0.05],
+      edges: [{ label: 'Fe-L', onset_ev: 708, Z: 26 }],
+      zlp_ev: 0, plasmon_ev: 17.6, thickness_nm: 100, elements_Z: [26],
+    });
+    render(
+      <MicroscopeControlsPanel session={eelsSession} sampleRegistered={true} runActive={false} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /^Acquire$/i }));
+    await waitFor(() => {
+      expect(twin.acquireSpectrum).toHaveBeenCalledWith({
+        ev_min: 0, ev_max: 1000, n_channels: 1024,
+      });
+      expect(screen.getByTestId('spectrum-plot')).toBeTruthy();
+      expect(screen.getByTestId('edge-Fe-L')).toBeTruthy();
+    });
+    expect(twin.acquireImage).not.toHaveBeenCalled();
   });
 });

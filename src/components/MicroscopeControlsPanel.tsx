@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Camera,
   Focus,
@@ -20,17 +20,32 @@ import {
   Zap,
   Gauge,
   ShieldAlert,
+  Activity,
+  Atom,
 } from 'lucide-react';
 import {
   acquireImage,
+  acquireSpectrum,
   runAutofocus,
   setStagePosition,
   setDetectorSettings,
+  setDiffractionSettings,
   setMode,
   setBeamSettings,
+  setResolution,
   type SessionSnapshot,
+  type SpectrumResult,
 } from '../api/digitalTwin';
+import {
+  computeAbtemDiffraction,
+  getAbtemAvailability,
+} from '../api/simulation';
 import { ApiError } from '../api/client';
+import { LinkedFovMag } from './controls/LinkedFovMag';
+import { SpectrumPlot } from './controls/SpectrumPlot';
+
+type ImagingMode = 'IMG' | 'DIFF' | 'EELS';
+type DiffEngine = 'kinematical' | 'abtem';
 
 interface MicroscopeControlsPanelProps {
   session: SessionSnapshot | null;
@@ -63,15 +78,40 @@ export function MicroscopeControlsPanel({
   const [tiltStep, setTiltStep] = useState(5);
   const [beamCurrent, setBeamCurrent] = useState(50);
   const [beamVoltage, setBeamVoltage] = useState(200);
+  // EELS
+  const [spectrum, setSpectrum] = useState<SpectrumResult | null>(null);
+  const [evMin, setEvMin] = useState(0);
+  const [evMax, setEvMax] = useState(1000);
+  const [nChannels, setNChannels] = useState(1024);
+  // Diffraction engine (kinematical = server; abTEM = decoupled dynamical path)
+  const [diffEngine, setDiffEngine] = useState<DiffEngine>('kinematical');
+  const [abtemAvailable, setAbtemAvailable] = useState<boolean | null>(null);
+  const [frozenPhonons, setFrozenPhonons] = useState(0);
+  const [abtemMeta, setAbtemMeta] = useState<string | null>(null);
+  // Kinematical diffraction settings
+  const [apertureUm, setApertureUm] = useState(0.4);
+  const [depthNm, setDepthNm] = useState(20);
+  const [cameraLengthMm, setCameraLengthMm] = useState(800);
+  const [beamstopPx, setBeamstopPx] = useState(6);
 
   const connected = session?.connected ?? false;
   const state = session?.state;
   const limits = state?.stage_limits;
-  const imagingMode = (state?.mode as 'IMG' | 'DIFF') ?? 'IMG';
+  const imagingMode = (state?.mode as ImagingMode) ?? 'IMG';
   const tiltA = state?.stage?.a ?? 0;
   const tiltB = state?.stage?.b ?? 0;
   const tiltLimit = limits?.a ?? 30;
+  const resolutionPx = state?.resolution?.resolution_px ?? 512;
+  const allowedResolutions = state?.resolution?.allowed ?? [512, 1024, 2048];
   const controlsEnabled = connected && sampleRegistered && !runActive && !isLoading;
+
+  // Grey out the abTEM toggle when the optional dependency is missing (501).
+  useEffect(() => {
+    if (!connected || abtemAvailable !== null) return;
+    getAbtemAvailability()
+      .then((r) => setAbtemAvailable(r.available))
+      .catch(() => setAbtemAvailable(false));
+  }, [connected, abtemAvailable]);
 
   const classifyError = (e: unknown, fallback: string): PanelError => {
     if (e instanceof ApiError) {
@@ -97,8 +137,15 @@ export function MicroscopeControlsPanel({
   };
 
   const doAcquire = async () => {
+    if (imagingMode === 'EELS') {
+      const result = await acquireSpectrum({ ev_min: evMin, ev_max: evMax, n_channels: nChannels });
+      setSpectrum(result);
+      onAcquired?.();
+      return;
+    }
     const result = await acquireImage('haadf');
     setCurrentImage(`data:image/png;base64,${result.image.image_base64}`);
+    setAbtemMeta(null); // viewer now shows a server (kinematical) frame
     setImageInfo({
       x_um: result.stage.x_um,
       y_um: result.stage.y_um,
@@ -112,10 +159,53 @@ export function MicroscopeControlsPanel({
 
   const handleAcquire = () =>
     runAction(
-      imagingMode === 'DIFF' ? 'Computing diffraction (may take a few seconds)...' : 'Acquiring...',
+      imagingMode === 'EELS'
+        ? 'Acquiring spectrum...'
+        : imagingMode === 'DIFF'
+          ? 'Computing diffraction (may take a few seconds)...'
+          : resolutionPx >= 2048
+            ? 'Acquiring (2048 px, ~30 s)...'
+            : 'Acquiring...',
       doAcquire,
-      'Failed to acquire image',
+      'Failed to acquire',
     );
+
+  // abTEM path: explicit compute button (seconds to tens of seconds), never
+  // auto-refresh. Stage tilt is applied to the atoms server-side in the
+  // FastAPI process — NOT by the twin (this path is decoupled from it).
+  const handleComputeAbtem = () =>
+    runAction('Computing dynamical pattern (abTEM)...', async () => {
+      const r = await computeAbtemDiffraction({ num_frozen_phonons: frozenPhonons });
+      setCurrentImage(`data:image/png;base64,${r.image.image_base64}`);
+      setImageInfo({
+        x_um: 0, y_um: 0, fov_um: fov,
+        a: r.state.tilt_a_deg, b: r.state.tilt_b_deg, mode: 'DIFF',
+      });
+      setAbtemMeta(
+        `abTEM · ${r.n_atoms.toLocaleString()} atoms · ${r.state.energy_kev.toFixed(0)} kV` +
+        (r.state.num_frozen_phonons ? ` · ${r.state.num_frozen_phonons} phonon configs` : '') +
+        (r.cached ? ' · cached' : ` · ${r.compute_seconds}s`),
+      );
+    }, 'Dynamical computation failed');
+
+  const handleDiffractionSettingsCommit = () =>
+    runAction('Applying diffraction settings...', async () => {
+      await setDiffractionSettings({
+        aperture_um: apertureUm,
+        depth_nm: depthNm,
+        camera_length_mm: cameraLengthMm,
+        beamstop_radius_px: beamstopPx,
+      });
+      await doAcquire();
+    }, 'Failed to apply diffraction settings');
+
+  const handleResolutionChange = (px: number) => {
+    if (px === resolutionPx) return;
+    return runAction(`Setting resolution to ${px} px...`, async () => {
+      await setResolution(px);
+      onAcquired?.();
+    }, 'Failed to set resolution');
+  };
 
   const handleAutofocus = () =>
     runAction('Autofocusing...', async () => {
@@ -158,11 +248,17 @@ export function MicroscopeControlsPanel({
     }, 'Failed to change FOV');
   };
 
-  const handleModeChange = (mode: 'IMG' | 'DIFF') => {
+  const handleModeChange = (mode: ImagingMode) => {
     if (mode === imagingMode) return;
     return runAction('Switching mode...', async () => {
       await setMode(mode);
-      await doAcquire();
+      // Refresh the viewer for image modes; EELS waits for an explicit acquire.
+      if (mode !== 'EELS') {
+        const result = await acquireImage('haadf');
+        setCurrentImage(`data:image/png;base64,${result.image.image_base64}`);
+        setAbtemMeta(null);
+      }
+      onAcquired?.();
     }, 'Failed to change mode');
   };
 
@@ -240,17 +336,33 @@ export function MicroscopeControlsPanel({
             <Sparkles className="w-3 h-3" />
             Diffraction
           </button>
+          <button
+            onClick={() => handleModeChange('EELS')}
+            disabled={!controlsEnabled}
+            className={`flex-1 px-3 py-1.5 text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${
+              imagingMode === 'EELS' ? 'bg-emerald-600 text-white' : 'bg-slate-700 text-slate-400 hover:bg-slate-600'
+            }`}
+          >
+            <Activity className="w-3 h-3" />
+            EELS
+          </button>
         </div>
       </div>
 
-      {/* Image display */}
+      {/* Viewer (image / diffraction / EELS line plot) */}
       <div className="relative aspect-square bg-black flex items-center justify-center">
-        {currentImage ? (
+        {imagingMode === 'EELS' && spectrum ? (
+          <SpectrumPlot spectrum={spectrum} />
+        ) : imagingMode !== 'EELS' && currentImage ? (
           <img src={currentImage} alt="Microscope view" className="w-full h-full object-contain" />
         ) : (
           <div className="text-center text-slate-600">
-            <ImageIcon className="w-16 h-16 mx-auto mb-2 opacity-30" />
-            <p className="text-sm">No image acquired</p>
+            {imagingMode === 'EELS' ? (
+              <Activity className="w-16 h-16 mx-auto mb-2 opacity-30" />
+            ) : (
+              <ImageIcon className="w-16 h-16 mx-auto mb-2 opacity-30" />
+            )}
+            <p className="text-sm">{imagingMode === 'EELS' ? 'No spectrum acquired' : 'No image acquired'}</p>
             <p className="text-xs mt-1 text-slate-700">
               {sampleRegistered ? 'Click Acquire to capture' : 'Register a sample first'}
             </p>
@@ -276,12 +388,18 @@ export function MicroscopeControlsPanel({
 
         <div
           className={`absolute top-2 right-2 text-white text-xs px-2 py-1 rounded-full flex items-center gap-1 ${
-            imagingMode === 'DIFF' ? 'bg-violet-600/90' : 'bg-cyan-600/90'
+            imagingMode === 'DIFF' ? 'bg-violet-600/90' : imagingMode === 'EELS' ? 'bg-emerald-600/90' : 'bg-cyan-600/90'
           }`}
         >
-          {imagingMode === 'DIFF' ? <Sparkles className="w-3 h-3" /> : <ImageIcon className="w-3 h-3" />}
-          {imagingMode === 'DIFF' ? 'Diffraction' : 'Imaging'}
+          {imagingMode === 'DIFF' ? <Sparkles className="w-3 h-3" /> : imagingMode === 'EELS' ? <Activity className="w-3 h-3" /> : <ImageIcon className="w-3 h-3" />}
+          {imagingMode === 'DIFF' ? (abtemMeta ? 'Diffraction (abTEM)' : 'Diffraction') : imagingMode === 'EELS' ? 'EELS' : 'Imaging'}
         </div>
+
+        {abtemMeta && imagingMode === 'DIFF' && (
+          <div className="absolute bottom-8 left-2 bg-violet-900/80 text-violet-200 text-[10px] px-2 py-1 rounded font-mono">
+            {abtemMeta}
+          </div>
+        )}
 
         {session?.sample?.name && (
           <div className="absolute top-2 left-2 bg-amber-600/90 text-white text-xs px-2 py-1 rounded-full font-mono">
@@ -320,18 +438,49 @@ export function MicroscopeControlsPanel({
           </button>
         </div>
 
-        {/* FOV / magnification */}
+        {/* Resolution windows (discrete, like a real scan generator) */}
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-slate-400 flex items-center gap-1">
+              <Scan className="w-4 h-4" />
+              Resolution
+            </span>
+            <span className="text-[10px] text-slate-600">higher = finer detail, slower frame</span>
+          </div>
+          <div className="flex rounded-lg overflow-hidden border border-slate-600">
+            {allowedResolutions.map((px) => (
+              <button
+                key={px}
+                onClick={() => handleResolutionChange(px)}
+                disabled={!controlsEnabled}
+                title={px >= 1024 ? `${px} px (slower${px >= 2048 ? ', ~30 s/frame' : ''})` : `${px} px`}
+                className={`flex-1 px-2 py-1.5 text-xs font-mono transition-colors ${
+                  resolutionPx === px ? 'bg-cyan-600 text-white' : 'bg-slate-700 text-slate-400 hover:bg-slate-600'
+                }`}
+              >
+                {px}{px >= 1024 ? '·slow' : ''}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* FOV / magnification (linked pair: two views of one quantity) */}
         <div className="space-y-2">
           <div className="flex items-center justify-between text-sm">
             <span className="text-slate-400 flex items-center gap-1">
               <ZoomIn className="w-4 h-4" />
-              Field of View
+              Field of View / Magnification
             </span>
             <span className="text-white font-mono text-xs bg-slate-700 px-2 py-0.5 rounded">
               {formatFov(fov)}
               {magnification ? ` · ${(magnification / 1e3).toFixed(1)} kx` : ''}
             </span>
           </div>
+          <LinkedFovMag
+            fovUm={state?.detectors?.haadf?.field_of_view_um ?? fov}
+            onCommit={(v) => handleFovChange(v)}
+            disabled={!controlsEnabled}
+          />
           <div className="flex items-center gap-2">
             <button
               onClick={zoomInFov}
@@ -469,6 +618,174 @@ export function MicroscopeControlsPanel({
             </div>
           </div>
         </div>
+
+        {/* Diffraction controls + engine toggle (DIFF mode only) */}
+        {imagingMode === 'DIFF' && (
+          <div className="space-y-3 pt-2 border-t border-slate-700">
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-slate-400 flex items-center gap-1">
+                <Sparkles className="w-4 h-4" />
+                Diffraction engine
+              </span>
+              <div className="flex rounded-lg overflow-hidden border border-slate-600">
+                <button
+                  onClick={() => setDiffEngine('kinematical')}
+                  className={`px-2 py-1 text-xs transition-colors ${
+                    diffEngine === 'kinematical' ? 'bg-violet-600 text-white' : 'bg-slate-700 text-slate-400'
+                  }`}
+                >
+                  Kinematical
+                </button>
+                <button
+                  onClick={() => abtemAvailable && setDiffEngine('abtem')}
+                  disabled={!abtemAvailable}
+                  title={
+                    abtemAvailable
+                      ? 'Dynamical multislice (slow, analysis-grade). Stage tilt is applied to the atoms by the backend — this path is decoupled from the twin server.'
+                      : 'abTEM is not installed on the backend (pip install abtem)'
+                  }
+                  className={`px-2 py-1 text-xs transition-colors flex items-center gap-1 ${
+                    diffEngine === 'abtem'
+                      ? 'bg-violet-600 text-white'
+                      : abtemAvailable
+                        ? 'bg-slate-700 text-slate-400'
+                        : 'bg-slate-800 text-slate-600 cursor-not-allowed'
+                  }`}
+                >
+                  <Atom className="w-3 h-3" />
+                  abTEM
+                </button>
+              </div>
+            </div>
+
+            {diffEngine === 'abtem' ? (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-slate-400 flex-1">Frozen phonons (0–16, slower)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={16}
+                    step={1}
+                    value={frozenPhonons}
+                    onChange={(e) => setFrozenPhonons(Math.min(16, Math.max(0, Math.round(Number(e.target.value) || 0))))}
+                    disabled={!controlsEnabled}
+                    aria-label="Frozen phonons"
+                    className="w-16 bg-slate-700 text-white text-xs font-mono rounded px-2 py-1 border border-slate-600 disabled:opacity-50"
+                  />
+                </div>
+                <button
+                  onClick={handleComputeAbtem}
+                  disabled={!controlsEnabled}
+                  className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-violet-600 hover:bg-violet-700 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-lg transition-colors text-xs font-medium"
+                >
+                  <Atom className="w-3.5 h-3.5" />
+                  Compute dynamical pattern
+                </button>
+                <p className="text-[10px] text-slate-600 leading-snug">
+                  Takes seconds to tens of seconds; results are cached per state.
+                  Stage α/β are applied to the atoms by the backend (decoupled from the server).
+                </p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-0.5">
+                  <label className="text-xs text-slate-400">Aperture (µm)</label>
+                  <input
+                    type="number" min={0} max={100} step={0.1} value={apertureUm}
+                    onChange={(e) => setApertureUm(Number(e.target.value))}
+                    disabled={!controlsEnabled}
+                    aria-label="Aperture (µm)"
+                    className="w-full bg-slate-700 text-white text-xs font-mono rounded px-2 py-1 border border-slate-600 disabled:opacity-50"
+                  />
+                </div>
+                <div className="space-y-0.5">
+                  <label className="text-xs text-slate-400">Depth (nm)</label>
+                  <input
+                    type="number" min={0} max={1000} step={1} value={depthNm}
+                    onChange={(e) => setDepthNm(Number(e.target.value))}
+                    disabled={!controlsEnabled}
+                    aria-label="Depth (nm)"
+                    className="w-full bg-slate-700 text-white text-xs font-mono rounded px-2 py-1 border border-slate-600 disabled:opacity-50"
+                  />
+                </div>
+                <div className="space-y-0.5">
+                  <label className="text-xs text-slate-400">Camera length (mm)</label>
+                  <input
+                    type="number" min={100} max={10000} step={50} value={cameraLengthMm}
+                    onChange={(e) => setCameraLengthMm(Number(e.target.value))}
+                    disabled={!controlsEnabled}
+                    aria-label="Camera length (mm)"
+                    className="w-full bg-slate-700 text-white text-xs font-mono rounded px-2 py-1 border border-slate-600 disabled:opacity-50"
+                  />
+                </div>
+                <div className="space-y-0.5">
+                  <label className="text-xs text-slate-400">Beamstop (px)</label>
+                  <input
+                    type="number" min={0} max={64} step={1} value={beamstopPx}
+                    onChange={(e) => setBeamstopPx(Number(e.target.value))}
+                    disabled={!controlsEnabled}
+                    aria-label="Beamstop (px)"
+                    className="w-full bg-slate-700 text-white text-xs font-mono rounded px-2 py-1 border border-slate-600 disabled:opacity-50"
+                  />
+                </div>
+                <button
+                  onClick={handleDiffractionSettingsCommit}
+                  disabled={!controlsEnabled}
+                  className="col-span-2 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-slate-200 rounded-lg transition-colors text-xs"
+                >
+                  Apply &amp; re-acquire
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* EELS controls (EELS mode only) */}
+        {imagingMode === 'EELS' && (
+          <div className="space-y-2 pt-2 border-t border-slate-700">
+            <div className="text-sm text-slate-400 flex items-center gap-1">
+              <Activity className="w-4 h-4" />
+              EELS acquisition
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              <div className="space-y-0.5">
+                <label className="text-xs text-slate-400">eV min</label>
+                <input
+                  type="number" min={0} max={5000} step={10} value={evMin}
+                  onChange={(e) => setEvMin(Number(e.target.value))}
+                  disabled={!controlsEnabled}
+                  aria-label="EELS eV min"
+                  className="w-full bg-slate-700 text-white text-xs font-mono rounded px-2 py-1 border border-slate-600 disabled:opacity-50"
+                />
+              </div>
+              <div className="space-y-0.5">
+                <label className="text-xs text-slate-400">eV max</label>
+                <input
+                  type="number" min={10} max={5000} step={10} value={evMax}
+                  onChange={(e) => setEvMax(Number(e.target.value))}
+                  disabled={!controlsEnabled}
+                  aria-label="EELS eV max"
+                  className="w-full bg-slate-700 text-white text-xs font-mono rounded px-2 py-1 border border-slate-600 disabled:opacity-50"
+                />
+              </div>
+              <div className="space-y-0.5">
+                <label className="text-xs text-slate-400">Channels</label>
+                <input
+                  type="number" min={16} max={8192} step={16} value={nChannels}
+                  onChange={(e) => setNChannels(Number(e.target.value))}
+                  disabled={!controlsEnabled}
+                  aria-label="EELS channels"
+                  className="w-full bg-slate-700 text-white text-xs font-mono rounded px-2 py-1 border border-slate-600 disabled:opacity-50"
+                />
+              </div>
+            </div>
+            <p className="text-[10px] text-slate-600 leading-snug">
+              Single-spot spectrum (probe parked at one position). The twin's spectrum is a
+              physically-structured dummy — edges reflect the elements under the probe.
+            </p>
+          </div>
+        )}
 
         {/* Beam controls */}
         <div className="space-y-3 pt-2 border-t border-slate-700">
