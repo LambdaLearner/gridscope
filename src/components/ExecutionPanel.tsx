@@ -21,7 +21,6 @@ interface ExecutionPanelProps {
   logs: ExecutionLog[];
   acquiredImages: AcquiredImage[];
   currentSampleType?: string;
-  currentMode?: string;
 }
 
 export const ExecutionPanel = memo(function ExecutionPanel({
@@ -31,8 +30,7 @@ export const ExecutionPanel = memo(function ExecutionPanel({
   onStop,
   logs,
   acquiredImages,
-  currentSampleType = 'au_nanoparticles',
-  currentMode = 'IMG'
+  currentSampleType = '',
 }: ExecutionPanelProps) {
   const [showCode, setShowCode] = useState(false);
   const [selectedImage, setSelectedImage] = useState<number | null>(null);
@@ -62,11 +60,8 @@ export const ExecutionPanel = memo(function ExecutionPanel({
     setUserHasScrolled(!isAtBottom);
   };
 
-  // Helper to get sample label
-  const getSampleLabel = (sampleType?: string) => {
-    if (sampleType === 'fcc_crystal') return 'FCC Crystal';
-    return 'Au Nanoparticles';
-  };
+  // Sample names come from the server registry; show them as-is.
+  const getSampleLabel = (sampleType?: string) => sampleType || 'unknown sample';
 
   const getLogIcon = (type: ExecutionLog['type']) => {
     switch (type) {
@@ -260,11 +255,7 @@ export const ExecutionPanel = memo(function ExecutionPanel({
               <span className="text-sm text-white font-medium">
                 Image {selectedImage + 1}
               </span>
-              <span className={`ml-2 text-xs px-1.5 py-0.5 rounded ${
-                acquiredImages[selectedImage].sampleType === 'fcc_crystal' 
-                  ? 'bg-emerald-600/20 text-emerald-400' 
-                  : 'bg-amber-600/20 text-amber-400'
-              }`}>
+              <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-amber-600/20 text-amber-400">
                 {getSampleLabel(acquiredImages[selectedImage].sampleType || currentSampleType)}
               </span>
               {acquiredImages[selectedImage].mode === 'DIFF' && (

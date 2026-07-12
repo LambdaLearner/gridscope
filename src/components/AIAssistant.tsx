@@ -2,27 +2,25 @@ import { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Bot, Send, Code, Loader2, Sparkles, X, Maximize2, Minimize2, Play, RotateCcw } from 'lucide-react';
 import { ExperimentConfig } from '../types/config';
-import type { ExecutionPlan } from '../types/execution';
 
 interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   code?: string;
-  executionPlan?: ExecutionPlan;
   timestamp: Date;
 }
 
 interface AIAssistantProps {
   experimentConfig: ExperimentConfig | null;
   onCodeGenerated?: (code: string) => void;
-  onRunCode?: (code: string, executionPlan?: ExecutionPlan) => void;
+  onRunCode?: (code: string) => void;
 }
 
 const INITIAL_MESSAGE: Message = {
   id: '1',
   role: 'assistant',
-  content: "Hello! I'm your **STEM Digital Twin** assistant. I can help you:\n\n- **Control the microscope** - move stage, adjust settings, switch imaging/diffraction modes\n- **Switch samples** - Au nanoparticles or FCC crystal\n- **Acquire images** - single shots or grid scans\n- **Generate Python scripts** - for automated experiments\n\nWhat would you like to do?",
+  content: "Hello! I'm your **STEM Digital Twin** assistant. I can help you:\n\n- **Control the microscope** - stage moves (within safety limits), imaging/diffraction modes, magnification\n- **Design experiments** - grid scans, tilt series, dose studies on the registered sample\n- **Generate portable Python scripts** - the same code runs on a real instrument\n\nRegister a sample in **Sample Settings** first, then tell me what to do!",
   timestamp: new Date(),
 };
 
@@ -89,7 +87,6 @@ export function AIAssistant({ experimentConfig, onCodeGenerated, onRunCode }: AI
         role: 'assistant',
         content: data.message,
         code: data.generated_code,
-        executionPlan: data.execution_plan,
         timestamp: new Date(),
       };
 
@@ -173,9 +170,9 @@ export function AIAssistant({ experimentConfig, onCodeGenerated, onRunCode }: AI
     }
   };
 
-  const handleRunCode = (code: string, executionPlan?: ExecutionPlan) => {
+  const handleRunCode = (code: string) => {
     if (onRunCode) {
-      onRunCode(code, executionPlan);
+      onRunCode(code);
     }
     setShowCode(null);
   };
@@ -288,7 +285,7 @@ export function AIAssistant({ experimentConfig, onCodeGenerated, onRunCode }: AI
                   </button>
                   {onRunCode && (
                     <button
-                      onClick={() => handleRunCode(message.code!, message.executionPlan)}
+                      onClick={() => handleRunCode(message.code!)}
                       className="flex items-center gap-1 text-xs text-emerald-300 hover:text-emerald-200 transition-colors bg-emerald-900/30 px-2 py-1 rounded"
                     >
                       <Play className="w-3 h-3" />

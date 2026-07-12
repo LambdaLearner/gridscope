@@ -1,18 +1,21 @@
 /**
- * API client for the STEM Digital Twin
+ * API client for the microscope CONTROL surface (/api/microscope).
+ *
+ * Everything here has a real-instrument counterpart. Twin-only configuration
+ * (samples, environments, degradation) lives in simulation.ts — mirroring the
+ * backend's control/simulation split.
  */
 
-const API_BASE_URL = 'http://localhost:8000/api/microscope';
+import { apiGet, apiPost } from './client';
 
-export interface StagePosition {
-  x: number;
+// ===== Types =====
+
+export interface StageLimits {
+  x: number; // metres, symmetric ±
   y: number;
   z: number;
-  a: number;
+  a: number; // degrees, symmetric ±
   b: number;
-  x_um: number;
-  y_um: number;
-  z_um: number;
 }
 
 export interface DetectorSettings {
@@ -20,7 +23,10 @@ export interface DetectorSettings {
   exposure: number;
   binning: number;
   field_of_view_um: number;
+  magnification: number;
+  dwell_us: number;
   noise_sigma: number;
+  [key: string]: number;
 }
 
 export interface BeamSettings {
@@ -30,35 +36,53 @@ export interface BeamSettings {
   voltage_kV: number;
 }
 
-export interface DiffractionSettings {
-  camera_length_mm: number;
-  beamstop_radius_px: number;
+export interface SampleStatus {
+  name: string | null;
+  registered: boolean;
 }
 
 export interface MicroscopeState {
-  stage: {
-    x: number;
-    y: number;
-    z: number;
-    a: number;
-    b: number;
-  };
+  stage: { x: number; y: number; z: number; a: number; b: number };
   beam: BeamSettings;
   vacuum: number;
   status: string;
   holder_type: string;
-  detectors: {
-    [key: string]: DetectorSettings;
-  };
-  mode?: string;  // "IMG" or "DIFF"
-  sample_type?: string;  // "au_nanoparticles" or "fcc_crystal"
-  diffraction?: DiffractionSettings;
-  tilt_enabled?: boolean;
+  mode: string; // "IMG" | "DIFF"
+  detectors: { [device: string]: DetectorSettings };
+  diffraction: { [key: string]: number };
+  environment: string;
+  sample: SampleStatus;
+  stage_limits: StageLimits;
 }
 
-export interface AcquiredImage {
-  image_base64?: string;
-  raw_base64?: string;
+export interface CommandLogEntry {
+  t: number;
+  method: string;
+  params: Record<string, unknown>;
+  result_preview: string;
+}
+
+export interface RunStatus {
+  active: boolean;
+  started_at: number | null;
+  label: string | null;
+}
+
+export interface SessionSnapshot {
+  connected: boolean;
+  state?: MicroscopeState;
+  sample?: SampleStatus;
+  run: RunStatus;
+  log?: CommandLogEntry[];
+}
+
+export interface StagePositionResult {
+  x: number; y: number; z: number; a: number; b: number;
+  x_um: number; y_um: number; z_um: number;
+}
+
+export interface AcquiredImagePayload {
+  image_base64: string;
   width: number;
   height: number;
   dtype: string;
@@ -67,262 +91,102 @@ export interface AcquiredImage {
 export interface AcquireResult {
   success: boolean;
   device: string;
-  image: AcquiredImage;
-  stage: {
-    x_um: number;
-    y_um: number;
-    z_um: number;
-  };
+  image: AcquiredImagePayload;
+  stage: { x_um: number; y_um: number; z_um: number; a: number; b: number };
+  mode: string;
+  sample: SampleStatus;
   settings: DetectorSettings;
 }
 
 export interface AutofocusResult {
   success: boolean;
   result: {
+    converged: boolean;
+    reason: string;
     best_z_m: number;
     best_z_um_relative: number;
+    curve_contrast: number;
+    n_candidate_peaks: number;
     scores: [number, number][];
   };
   new_z_um: number;
 }
 
-/**
- * Check microscope connection status
- */
-export async function getMicroscopeStatus(): Promise<{
+// ===== Endpoints =====
+
+export function getMicroscopeStatus(): Promise<{
   connected: boolean;
-  host?: string;
-  port?: number;
-  state?: MicroscopeState;
+  ready?: boolean;
+  sample?: string | null;
   error?: string;
 }> {
-  try {
-    const response = await fetch(`${API_BASE_URL}/status`);
-    return response.json();
-  } catch (error) {
-    return { connected: false, error: String(error) };
-  }
+  return apiGet('/microscope/status');
+}
+
+export function getSession(logLastN = 30): Promise<SessionSnapshot> {
+  return apiGet(`/microscope/session?log_last_n=${logLastN}`);
+}
+
+export function getMicroscopeState(): Promise<MicroscopeState> {
+  return apiGet('/microscope/state');
+}
+
+export function getStageLimits(): Promise<{ limits: StageLimits }> {
+  return apiGet('/microscope/limits');
+}
+
+export function getStagePosition(): Promise<StagePositionResult> {
+  return apiGet('/microscope/stage');
 }
 
 /**
- * Get current microscope state
+ * Move the stage. Throws ApiError(400) with the twin's violation message when
+ * the move is rejected by the soft limits — the stage does not move.
  */
-export async function getMicroscopeState(): Promise<MicroscopeState> {
-  const response = await fetch(`${API_BASE_URL}/state`);
-  if (!response.ok) {
-    throw new Error('Failed to get microscope state');
-  }
-  return response.json();
-}
-
-/**
- * Get current stage position
- */
-export async function getStagePosition(): Promise<StagePosition> {
-  const response = await fetch(`${API_BASE_URL}/stage`);
-  if (!response.ok) {
-    throw new Error('Failed to get stage position');
-  }
-  return response.json();
-}
-
-/**
- * Set stage position
- */
-export async function setStagePosition(
+export function setStagePosition(
   position: Partial<{ x: number; y: number; z: number; a: number; b: number }>,
-  relative: boolean = true
-): Promise<{ success: boolean; new_position: StagePosition }> {
-  const response = await fetch(`${API_BASE_URL}/stage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ position, relative }),
-  });
-  if (!response.ok) {
-    throw new Error('Failed to set stage position');
-  }
-  return response.json();
+  relative = true,
+): Promise<{ success: boolean; new_position: StagePositionResult }> {
+  return apiPost('/microscope/stage', { position, relative });
 }
 
-/**
- * Get detector settings
- */
-export async function getDetectorSettings(
-  device: string = 'haadf'
-): Promise<{ device: string; settings: DetectorSettings }> {
-  const response = await fetch(`${API_BASE_URL}/detectors/${device}`);
-  if (!response.ok) {
-    throw new Error('Failed to get detector settings');
-  }
-  return response.json();
-}
-
-/**
- * Set detector settings
- */
-export async function setDetectorSettings(
+export function setDetectorSettings(
   device: string,
-  settings: Partial<DetectorSettings>
+  settings: Partial<DetectorSettings>,
 ): Promise<{ success: boolean; settings: DetectorSettings }> {
-  const response = await fetch(`${API_BASE_URL}/detectors/${device}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(settings),
-  });
-  if (!response.ok) {
-    throw new Error('Failed to set detector settings');
-  }
-  return response.json();
+  return apiPost(`/microscope/detectors/${device}`, settings);
 }
 
-/**
- * Acquire an image
- */
-export async function acquireImage(
-  device: string = 'haadf'
-): Promise<AcquireResult> {
-  const response = await fetch(`${API_BASE_URL}/acquire`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ device }),
-  });
-  if (!response.ok) {
-    throw new Error('Failed to acquire image');
-  }
-  return response.json();
+export function setMagnification(
+  magnification: number,
+  device = 'haadf',
+): Promise<{ success: boolean; magnification: number; field_of_view_um: number }> {
+  return apiPost('/microscope/magnification', { magnification, device });
 }
 
-/**
- * Run autofocus
- */
-export async function runAutofocus(
-  device: string = 'haadf',
-  z_range_um: number = 2.0,
-  z_steps: number = 9
+export function acquireImage(device = 'haadf'): Promise<AcquireResult> {
+  return apiPost('/microscope/acquire', { device });
+}
+
+export function runAutofocus(
+  device = 'haadf',
+  z_range_um = 2.0,
+  z_steps = 9,
 ): Promise<AutofocusResult> {
-  const response = await fetch(`${API_BASE_URL}/autofocus`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ device, z_range_um, z_steps }),
-  });
-  if (!response.ok) {
-    throw new Error('Autofocus failed');
-  }
-  return response.json();
+  return apiPost('/microscope/autofocus', { device, z_range_um, z_steps });
 }
 
-/**
- * Set imaging mode (IMG or DIFF)
- */
-export async function setMode(
-  mode: 'IMG' | 'DIFF'
-): Promise<{ success: boolean; mode: string }> {
-  const response = await fetch(`${API_BASE_URL}/execute`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command: 'set_mode', params: { mode } }),
-  });
-  if (!response.ok) {
-    throw new Error('Failed to set mode');
-  }
-  return response.json();
+export function setMode(mode: 'IMG' | 'DIFF'): Promise<{ success: boolean; mode: string }> {
+  return apiPost('/microscope/mode', { mode });
 }
 
-/**
- * Set sample type
- */
-export async function setSampleType(
-  sampleType: 'au_nanoparticles' | 'fcc_crystal'
-): Promise<{ success: boolean; sample_type: string }> {
-  const response = await fetch(`${API_BASE_URL}/execute`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command: 'set_sample_type', params: { sample_type: sampleType } }),
-  });
-  if (!response.ok) {
-    throw new Error('Failed to set sample type');
-  }
-  return response.json();
+export function setBeamSettings(
+  settings: Partial<BeamSettings>,
+  relative = false,
+): Promise<{ success: boolean; new_beam: BeamSettings }> {
+  return apiPost('/microscope/beam', { settings, relative });
 }
 
-/**
- * Set diffraction settings
- */
-export async function setDiffractionSettings(
-  settings: Partial<DiffractionSettings>
-): Promise<{ success: boolean; settings: DiffractionSettings }> {
-  const response = await fetch(`${API_BASE_URL}/execute`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command: 'set_diffraction_settings', params: settings }),
-  });
-  if (!response.ok) {
-    throw new Error('Failed to set diffraction settings');
-  }
-  return response.json();
-}
-
-/**
- * Set beam settings (current, voltage)
- */
-export async function setBeamSettings(
-  settings: Partial<BeamSettings>
-): Promise<{ success: boolean; beam: BeamSettings }> {
-  const response = await fetch(`${API_BASE_URL}/execute`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command: 'set_beam', params: { beam_settings: settings } }),
-  });
-  if (!response.ok) {
-    throw new Error('Failed to set beam settings');
-  }
-  return response.json();
-}
-
-/**
- * Execute a command on the microscope
- */
-export async function executeCommand(
-  command: string,
-  params: Record<string, unknown> = {}
-): Promise<{ success: boolean; command: string; result: unknown }> {
-  const response = await fetch(`${API_BASE_URL}/execute`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command, params }),
-  });
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.detail || 'Command execution failed');
-  }
-  return response.json();
-}
-
-/**
- * Start the digital twin server
- */
-export async function startDigitalTwinServer(): Promise<{
-  status: string;
-  port: number;
-}> {
-  const response = await fetch(`${API_BASE_URL}/start-server`, {
-    method: 'POST',
-  });
-  if (!response.ok) {
-    throw new Error('Failed to start digital twin server');
-  }
-  return response.json();
-}
-
-/**
- * Get command log
- */
-export async function getCommandLog(
-  lastN: number = 50
-): Promise<{ log: unknown[]; count: number }> {
-  const response = await fetch(`${API_BASE_URL}/log?last_n=${lastN}`);
-  if (!response.ok) {
-    throw new Error('Failed to get command log');
-  }
-  return response.json();
+export function startDigitalTwinServer(): Promise<{ status: string; port: number }> {
+  return apiPost('/microscope/start-server');
 }

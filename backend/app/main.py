@@ -13,7 +13,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-from .routes import chat_router, code_router, health_router, microscope_router, execute_router
+from .routes import (
+    chat_router,
+    code_router,
+    health_router,
+    microscope_router,
+    simulation_router,
+    execute_router,
+)
 
 
 # Load environment variables
@@ -67,6 +74,7 @@ app.include_router(health_router)
 app.include_router(chat_router, prefix="/api")
 app.include_router(code_router, prefix="/api")
 app.include_router(microscope_router, prefix="/api")
+app.include_router(simulation_router, prefix="/api")
 app.include_router(execute_router, prefix="/api")
 
 

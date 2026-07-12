@@ -1,11 +1,20 @@
-"""Tests for backend/app/constants.py — validate shared constants."""
+"""Tests for constants.py — including the spec-vs-client drift guard.
+
+MICROSCOPE_API_SPEC is hand-written prose shown to the LLM; these tests make
+drift from the real MicroscopeControlClient a test failure instead of a
+silently wrong prompt.
+"""
+
+import re
 
 from app.constants import (
+    CONTROL_CLIENT_SOURCE_PATH,
     DEFAULT_DETECTOR,
+    IMAGE_MARKER,
     MICROSCOPE_API_SPEC,
     WORKFLOW_TEMPLATES,
-    TEM_CLIENT_SOURCE_PATH,
 )
+from app.digital_twin.control_client import MicroscopeControlClient
 
 
 class TestDefaultDetector:
@@ -16,84 +25,96 @@ class TestDefaultDetector:
         assert DEFAULT_DETECTOR == DEFAULT_DETECTOR.lower()
 
 
-class TestMicroscopeApiSpec:
-    def test_spec_is_nonempty_string(self):
-        assert isinstance(MICROSCOPE_API_SPEC, str)
-        assert len(MICROSCOPE_API_SPEC) > 100
+class TestSpecMatchesControlClient:
+    """The drift guard: every method the spec documents must exist on the
+    client, and nothing simulation-only may appear in the spec."""
 
-    def test_spec_contains_all_core_methods(self):
-        required_methods = [
-            "is_connected",
-            "get_detectors",
-            "get_detector_settings",
-            "device_settings",
-            "get_stage",
-            "set_stage",
-            "get_microscope_state",
-            "acquire_image",
-            "autofocus",
-            "get_command_log",
-            "clear_command_log",
-        ]
-        for method in required_methods:
-            assert method in MICROSCOPE_API_SPEC, f"Missing method: {method}"
+    def _spec_methods(self):
+        return set(re.findall(r"mic\.(\w+)\(", MICROSCOPE_API_SPEC))
 
-    def test_spec_contains_extended_methods(self):
-        extended_methods = [
-            "set_mode",
-            "get_mode",
-            "set_beam",
-            "get_beam",
-            "set_tilt",
-            "get_tilt",
-            "set_sample_type",
-            "get_sample_type",
-            "set_diffraction_settings",
-            "get_diffraction_settings",
-        ]
-        for method in extended_methods:
-            assert method in MICROSCOPE_API_SPEC, f"Missing extended method: {method}"
+    def test_spec_documents_methods(self):
+        assert len(self._spec_methods()) >= 15
+
+    def test_every_documented_method_exists_on_client(self):
+        for method in self._spec_methods():
+            assert hasattr(MicroscopeControlClient, method), (
+                f"MICROSCOPE_API_SPEC documents mic.{method}() but "
+                f"MicroscopeControlClient has no such method"
+            )
+
+    def test_every_public_client_method_is_documented(self):
+        public = {
+            name for name in vars(MicroscopeControlClient)
+            if not name.startswith("_")
+            and callable(getattr(MicroscopeControlClient, name))
+        }
+        undocumented = public - self._spec_methods()
+        assert not undocumented, (
+            f"Control-client methods missing from MICROSCOPE_API_SPEC: {undocumented}"
+        )
+
+    def test_spec_never_mentions_simulation_surface(self):
+        for forbidden in ["SimulationHarness", "load_sample", "set_environment",
+                          "set_drift", "set_specimen", "reset_specimen",
+                          "list_samples"]:
+            assert forbidden not in MICROSCOPE_API_SPEC, (
+                f"simulation-only concept '{forbidden}' leaked into the "
+                f"portable control spec"
+            )
+
+    def test_spec_mentions_units_and_limits(self):
+        assert "METRES" in MICROSCOPE_API_SPEC
+        assert "DEGREES" in MICROSCOPE_API_SPEC
+        assert "1.5" in MICROSCOPE_API_SPEC  # x/y limit in mm
+        assert "converged" in MICROSCOPE_API_SPEC
 
     def test_spec_mentions_haadf_detector(self):
-        assert "haadf" in MICROSCOPE_API_SPEC
-
-    def test_spec_mentions_meters_for_stage(self):
-        assert "METERS" in MICROSCOPE_API_SPEC
-
-    def test_spec_mentions_degrees_for_tilt(self):
-        assert "DEGREES" in MICROSCOPE_API_SPEC
+        assert DEFAULT_DETECTOR in MICROSCOPE_API_SPEC
 
 
 class TestWorkflowTemplates:
     def test_templates_is_dict(self):
         assert isinstance(WORKFLOW_TEMPLATES, dict)
+        assert len(WORKFLOW_TEMPLATES) >= 4
 
     def test_expected_keys_present(self):
-        expected = ["tilt_series", "diffraction_scan", "beam_sweep", "mode_switch"]
-        for key in expected:
-            assert key in WORKFLOW_TEMPLATES, f"Missing template: {key}"
+        for key in ["tilt_series", "diffraction_scan", "grid_scan",
+                    "magnification_series"]:
+            assert key in WORKFLOW_TEMPLATES
 
     def test_each_template_is_nonempty_string(self):
-        for key, value in WORKFLOW_TEMPLATES.items():
-            assert isinstance(value, str), f"Template {key} is not a string"
-            assert len(value) > 10, f"Template {key} is too short"
+        for name, code in WORKFLOW_TEMPLATES.items():
+            assert isinstance(code, str) and code.strip(), name
 
-    def test_tilt_series_uses_set_tilt(self):
-        assert "set_tilt" in WORKFLOW_TEMPLATES["tilt_series"]
+    def test_templates_use_control_client_only(self):
+        for name, code in WORKFLOW_TEMPLATES.items():
+            for forbidden in ["load_sample", "set_environment", "set_drift",
+                              "set_specimen", "STEMClient", "SimulationHarness"]:
+                assert forbidden not in code, f"{name} uses {forbidden}"
 
-    def test_diffraction_scan_uses_set_mode(self):
-        assert 'set_mode("DIFF")' in WORKFLOW_TEMPLATES["diffraction_scan"]
+    def test_acquiring_templates_report_images(self):
+        for name, code in WORKFLOW_TEMPLATES.items():
+            if "acquire_image" in code:
+                assert "report_image(" in code, (
+                    f"template '{name}' acquires but never reports the frame"
+                )
 
-    def test_beam_sweep_uses_set_beam(self):
-        assert "set_beam" in WORKFLOW_TEMPLATES["beam_sweep"]
+    def test_templates_handle_failures(self):
+        assert "except RuntimeError" in WORKFLOW_TEMPLATES["tilt_series"]
+        assert 'af["converged"]' in WORKFLOW_TEMPLATES["grid_scan"]
 
 
-class TestTemClientSourcePath:
+class TestControlClientSource:
     def test_path_points_to_existing_file(self):
-        assert TEM_CLIENT_SOURCE_PATH.exists(), (
-            f"tem_client.py not found at {TEM_CLIENT_SOURCE_PATH}"
-        )
+        assert CONTROL_CLIENT_SOURCE_PATH.exists()
 
-    def test_source_contains_stemclient_class(self):
-        source = TEM_CLIENT_SOURCE_PATH.read_text()
-        assert "class STEMClient" in source
+    def test_source_contains_control_client_class(self):
+        src = CONTROL_CLIENT_SOURCE_PATH.read_text()
+        assert "class MicroscopeControlClient" in src
+        assert "SimulationHarness" not in src
+
+
+class TestImageMarker:
+    def test_marker_is_distinctive(self):
+        assert IMAGE_MARKER.startswith("##")
+        assert len(IMAGE_MARKER) >= 10
