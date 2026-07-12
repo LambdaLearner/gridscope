@@ -557,3 +557,66 @@ class TestTiltConvention:
         assert any(np.allclose(I_a, c, atol=200.0) for c in candidates), (
             "alpha and beta tilts are not acting on perpendicular detector axes"
         )
+
+
+# ---------------------------------------------------------------------------
+# Registry contract: what the schema-driven GUI depends on
+# ---------------------------------------------------------------------------
+class TestRegistryContract:
+    """The frontend renders parameter controls purely from param_schema and
+    treats seed-like params specially. These tests pin that contract."""
+
+    EXPECTED_SAMPLES = {
+        "fcc_single_crystal", "bcc_single_crystal", "hcp_single_crystal",
+        "polycrystal_grains", "dislocation_crystal", "amorphous_film",
+        "au_dispersed", "au_clustered", "au_bimodal", "au_on_substrate",
+        "core_shell", "shape_assembly", "atomsk_polycrystal",
+    }
+
+    def _registry(self):
+        return {s["name"]: s for s in samples.list_samples()}
+
+    def test_all_13_samples_registered(self):
+        assert set(self._registry()) >= self.EXPECTED_SAMPLES
+
+    def test_param_schema_entries_are_renderable(self):
+        for name, s in self._registry().items():
+            for pname, schema in s["param_schema"].items():
+                assert schema.get("type") in ("int", "float", "bool", "str"), (
+                    f"{name}.{pname} has unrenderable type {schema.get('type')}")
+                if "min" in schema and "max" in schema:
+                    assert schema["min"] <= schema["max"], f"{name}.{pname}"
+
+    def test_defaults_exist_for_every_schema_param(self):
+        for name, s in self._registry().items():
+            for pname in s["param_schema"]:
+                assert pname in s["default_params"], (
+                    f"{name}.{pname} has a schema but no default to pre-fill")
+
+    def test_headline_knobs_present_with_spec_ranges(self):
+        reg = self._registry()
+        poly = reg["polycrystal_grains"]["param_schema"]
+        assert poly["n_grains"]["type"] == "int"
+        assert (poly["n_grains"]["min"], poly["n_grains"]["max"]) == (2, 12)
+        disl = reg["dislocation_crystal"]["param_schema"]
+        assert (disl["n_dislocations"]["min"], disl["n_dislocations"]["max"]) == (1, 40)
+        assert "disl_seed" in disl
+        assert "n_particles" in reg["au_dispersed"]["param_schema"]
+        atomsk = reg["atomsk_polycrystal"]["param_schema"]
+        assert atomsk["file_path"]["type"] == "str"
+        assert atomsk["auto_fit"]["type"] == "bool"
+
+    def test_new_sample_identities_match_spec(self):
+        reg = self._registry()
+        assert "Fe (FCC" in reg["fcc_single_crystal"]["display_name"]
+        assert "Fe (BCC" in reg["bcc_single_crystal"]["display_name"]
+        assert "Mg" in reg["hcp_single_crystal"]["display_name"]
+
+    def test_stochastic_samples_expose_a_seed(self):
+        reg = self._registry()
+        for name in ["polycrystal_grains", "amorphous_film",
+                     "au_dispersed", "au_clustered", "au_bimodal",
+                     "au_on_substrate", "core_shell"]:
+            schema = reg[name]["param_schema"]
+            assert any(k == "seed" or k.endswith("_seed") for k in schema), (
+                f"stochastic sample {name} exposes no seed in param_schema")
