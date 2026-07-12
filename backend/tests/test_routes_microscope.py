@@ -80,6 +80,19 @@ class FakeControl:
     def device_settings(self, device, **kw):
         return 1
 
+    def get_resolution(self, device="haadf"):
+        return {"resolution_px": 512, "allowed": [512, 1024, 2048]}
+
+    def set_resolution(self, resolution_px, device="haadf"):
+        return {"resolution_px": resolution_px, "allowed": [512, 1024, 2048]}
+
+    def acquire_spectrum(self, ev_min=0.0, ev_max=1000.0, n_channels=1024,
+                         cx_um=None, cy_um=None):
+        return {"energy_ev": [ev_min, ev_max], "intensity": [1.0, 0.5],
+                "edges": [{"label": "Fe-L", "onset_ev": 708, "Z": 26}],
+                "zlp_ev": 0.0, "plasmon_ev": 17.6, "thickness_nm": 100.0,
+                "elements_Z": [26]}
+
 
 class FakeHarness:
     def get_command_log(self, last_n=50):
@@ -106,6 +119,9 @@ class NoSampleControl(FakeControl):
         raise RuntimeError(f"Server error: {NO_SAMPLE_MSG}")
 
     def autofocus(self, **kw):
+        raise RuntimeError(f"Server error: {NO_SAMPLE_MSG}")
+
+    def acquire_spectrum(self, **kw):
         raise RuntimeError(f"Server error: {NO_SAMPLE_MSG}")
 
 
@@ -205,6 +221,52 @@ class TestAcquireAndAutofocus:
         assert r.json()["result"]["converged"] is False
 
 
+class TestResolutionAndSpectrum:
+    def test_get_resolution(self, client):
+        r = client.get("/api/microscope/resolution")
+        assert r.status_code == 200
+        assert r.json()["resolution_px"] == 512
+        assert r.json()["allowed"] == [512, 1024, 2048]
+
+    def test_set_resolution_valid(self, client):
+        r = client.post("/api/microscope/resolution", json={"resolution_px": 1024})
+        assert r.status_code == 200
+        assert r.json()["resolution_px"] == 1024
+
+    @pytest.mark.parametrize("bad", [256, 768, 4096, 0])
+    def test_set_resolution_invalid_is_422(self, client, bad):
+        r = client.post("/api/microscope/resolution", json={"resolution_px": bad})
+        assert r.status_code == 422
+
+    def test_acquire_spectrum(self, client):
+        r = client.post("/api/microscope/spectrum",
+                        json={"ev_min": 0.0, "ev_max": 1000.0, "n_channels": 1024})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["edges"][0]["label"] == "Fe-L"
+        assert body["elements_Z"] == [26]
+
+    @pytest.mark.parametrize("payload", [
+        {"ev_min": 500.0, "ev_max": 500.0},     # empty range
+        {"ev_min": 800.0, "ev_max": 100.0},     # inverted range
+        {"n_channels": 8},                       # below floor
+        {"n_channels": 100000},                  # above cap
+        {"ev_max": 9000.0},                      # beyond detector range
+    ])
+    def test_spectrum_validation_is_422(self, client, payload):
+        r = client.post("/api/microscope/spectrum", json=payload)
+        assert r.status_code == 422
+
+    def test_spectrum_without_sample_is_409(self, monkeypatch):
+        monkeypatch.setattr(ts, "get_control", lambda: NoSampleControl())
+        monkeypatch.setattr(ts, "get_harness", lambda: FakeHarness())
+        ts.end_run()
+        client = TestClient(app)
+        r = client.post("/api/microscope/spectrum", json={})
+        assert r.status_code == 409
+        assert "No sample registered" in r.json()["detail"]
+
+
 class TestRunLock:
     def test_mutations_rejected_while_run_active(self, client):
         assert ts.try_begin_run("test")
@@ -213,6 +275,8 @@ class TestRunLock:
                 ("/api/microscope/stage", {"position": {"x": 1e-6}, "relative": True}),
                 ("/api/microscope/acquire", {"device": "haadf"}),
                 ("/api/microscope/mode", {"mode": "DIFF"}),
+                ("/api/microscope/resolution", {"resolution_px": 1024}),
+                ("/api/microscope/spectrum", {}),
             ]:
                 r = client.post(path, json=payload)
                 assert r.status_code == 409, path

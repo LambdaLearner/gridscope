@@ -26,12 +26,24 @@ class SimulationHarness:
     # ---- specimen selection (real microscopes have a physical specimen) ----
     def list_samples(self): return self._call("list_samples")
     def get_current_sample(self): return self._call("get_current_sample")
-    def load_sample(self, name, params=None, D=None, H=None, W=None):
+    def load_sample(self, name, params=None, D=None, H=None, W=None,
+                    thickness_nm=None, thickness_seed=None):
         p = {"name": name, "params": params or {}}
         if D is not None: p["D"] = D
         if H is not None: p["H"] = H
         if W is not None: p["W"] = W
+        if thickness_nm is not None: p["thickness_nm"] = thickness_nm
+        if thickness_seed is not None: p["thickness_seed"] = thickness_seed
         return self._call("load_sample", p)
+
+    # ---- specimen thickness selection (twin-only: on a real instrument the
+    # local thickness is whatever region of the physical foil you are on) ----
+    def get_thickness(self): return self._call("get_thickness")
+    def set_thickness(self, thickness_nm=None, thickness_seed=None):
+        p = {}
+        if thickness_nm is not None: p["thickness_nm"] = thickness_nm
+        if thickness_seed is not None: p["thickness_seed"] = thickness_seed
+        return self._call("set_thickness", p)
 
     # ---- simulation environment (named realism scenarios) ----
     def set_environment(self, name="pristine"): return self._call("set_environment", {"name": name})

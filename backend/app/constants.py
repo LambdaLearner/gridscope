@@ -68,9 +68,17 @@ mic.set_beam(bs: Dict[str, float], relative: bool = False) -> Dict
 mic.get_optics() -> Dict
 mic.set_optics(cs_mm=..., aperture_probe_px=...) -> Dict
 
-# --- Mode (IMG / DIFF) ---
-mic.get_mode() -> Dict            # {"mode": "IMG"} or {"mode": "DIFF"}
-mic.set_mode(mode: str) -> Dict   # "IMG" or "DIFF"
+# --- Mode (IMG / DIFF / EELS) ---
+mic.get_mode() -> Dict            # {"mode": "IMG"|"DIFF"|"EELS"}
+mic.set_mode(mode: str) -> Dict   # "IMG", "DIFF", or "EELS"
+
+# --- Acquisition resolution windows (discrete, like a real scan generator) ---
+mic.get_resolution(device="haadf") -> Dict
+    # {"resolution_px": 512, "allowed": [512, 1024, 2048]}
+mic.set_resolution(resolution_px: int, device="haadf") -> Dict
+    # resolution_px must be one of 512/1024/2048; anything else raises.
+    # Higher resolution = finer detail at the same FOV but a slower frame
+    # (2048 px can take ~30 s).
 
 # --- Diffraction projection ---
 mic.get_diffraction_settings() -> Dict
@@ -81,6 +89,14 @@ mic.set_diffraction_settings(camera_length_mm=..., beamstop_radius_px=...,
 mic.acquire_image(device: str) -> np.ndarray
     # uint16 frame (image in IMG mode, diffraction pattern in DIFF mode).
     # Diffraction frames may take 1-5 s to compute on the twin.
+
+# --- EELS spectrum acquisition (single-spot; probe parked at one position) ---
+mic.acquire_spectrum(ev_min=0.0, ev_max=1000.0, n_channels=1024,
+                     cx_um=None, cy_um=None) -> Dict
+    # {"energy_ev": [...], "intensity": [...],
+    #  "edges": [{"label": "Fe-L", "onset_ev": 708, "Z": 26}, ...],
+    #  "plasmon_ev": float, "thickness_nm": float, "elements_Z": [...]}
+    # Core-loss edges reflect the elements actually under the probe.
 
 # --- Autofocus (CAN FAIL) ---
 mic.autofocus(device="haadf", z_range_um=2.0, z_steps=9) -> Dict

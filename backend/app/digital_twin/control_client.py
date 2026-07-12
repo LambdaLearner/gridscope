@@ -118,8 +118,25 @@ class MicroscopeControlClient:
     def get_diffraction_settings(self): return self._call("get_diffraction_settings")
     def set_diffraction_settings(self, **kw): return self._call("set_diffraction_settings", kw)
 
+    # ---- acquisition resolution windows ----
+    # Real STEM scans / cameras offer a small set of fixed acquisition sizes.
+    # Higher resolution resolves finer detail at the same FOV but is slower.
+    def get_resolution(self, device="haadf"): return self._call("get_resolution", {"device": device})
+    def set_resolution(self, resolution_px, device="haadf"):
+        return self._call("set_resolution", {"resolution_px": resolution_px, "device": device})
+
     # ---- acquisition ----
     def acquire_image(self, device, **kw): return self._decode(self._call("acquire_image", {"device": device, **kw}))
+
+    # ---- EELS (single-spot spectrum; probe parked at one position) ----
+    # Real instruments expose the same acquisition; the twin returns a
+    # physically-structured dummy spectrum (ZLP, plasmon, core-loss edges).
+    def acquire_spectrum(self, ev_min=0.0, ev_max=1000.0, n_channels=1024,
+                         cx_um=None, cy_um=None):
+        p = {"ev_min": ev_min, "ev_max": ev_max, "n_channels": n_channels}
+        if cx_um is not None: p["cx_um"] = cx_um
+        if cy_um is not None: p["cy_um"] = cy_um
+        return self._call("acquire_spectrum", p)
 
     # ---- autofocus ----
     # A real instrument-side routine; its FAILURE behavior on the twin is driven
