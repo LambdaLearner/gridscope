@@ -56,7 +56,7 @@ class TestSpecMatchesControlClient:
     def test_spec_never_mentions_simulation_surface(self):
         for forbidden in ["SimulationHarness", "load_sample", "set_environment",
                           "set_drift", "set_specimen", "reset_specimen",
-                          "list_samples"]:
+                          "list_samples", "set_thickness", "get_thickness"]:
             assert forbidden not in MICROSCOPE_API_SPEC, (
                 f"simulation-only concept '{forbidden}' leaked into the "
                 f"portable control spec"
@@ -89,8 +89,18 @@ class TestWorkflowTemplates:
     def test_templates_use_control_client_only(self):
         for name, code in WORKFLOW_TEMPLATES.items():
             for forbidden in ["load_sample", "set_environment", "set_drift",
-                              "set_specimen", "STEMClient", "SimulationHarness"]:
+                              "set_specimen", "STEMClient", "SimulationHarness",
+                              "set_thickness", "get_thickness"]:
                 assert forbidden not in code, f"{name} uses {forbidden}"
+
+    def test_spec_documents_new_control_surface(self):
+        """The v6+ additions must be visible to the LLM."""
+        for method in ["set_resolution", "get_resolution", "acquire_spectrum"]:
+            assert f"mic.{method}(" in MICROSCOPE_API_SPEC, (
+                f"{method} missing from the documented control surface"
+            )
+        assert "512" in MICROSCOPE_API_SPEC and "2048" in MICROSCOPE_API_SPEC
+        assert "EELS" in MICROSCOPE_API_SPEC
 
     def test_acquiring_templates_report_images(self):
         for name, code in WORKFLOW_TEMPLATES.items():

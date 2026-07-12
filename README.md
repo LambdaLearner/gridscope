@@ -6,7 +6,7 @@
 
 ## Overview
 
-GridScope is an AI-powered automation platform for Scanning Transmission Electron Microscopy (STEM) that bridges the gap between experimental design and instrument execution. Researchers describe imaging objectives in natural language—such as *"acquire a 5×5 grid at 3 µm spacing"* or *"explore tilt angles from 0° to 30°"*—and receive executable Python scripts validated against a physics-based Digital Twin (v6, ported from `STEM_Digital_Twin_Modular_final_w_PyJEM.ipynb`).
+GridScope is an AI-powered automation platform for Scanning Transmission Electron Microscopy (STEM) that bridges the gap between experimental design and instrument execution. Researchers describe imaging objectives in natural language—such as *"acquire a 5×5 grid at 3 µm spacing"* or *"explore tilt angles from 0° to 30°"*—and receive executable Python scripts validated against a physics-based Digital Twin (v6+, ported from `Digital_twin_revised/STEM_Digital_Twin_Modular_final_w_PyJEM_with_abTEM.ipynb`; GUI per `STEM_Twin_GUI_Build_Spec.md`).
 
 ### The control / simulation split
 
@@ -14,22 +14,29 @@ The system keeps two surfaces strictly apart, so what you test here deploys ther
 
 - **Microscope control** (`/api/microscope`, `MicroscopeControlClient`) — every
   operation has a real-instrument counterpart: stage (with soft safety limits),
-  beam, imaging/diffraction mode, magnification↔FOV, detectors, acquisition,
-  autofocus. Generated scripts use **only** this surface.
+  beam, IMG/DIFF/EELS modes, magnification↔FOV, discrete resolution windows
+  (512/1024/2048 px), detectors, image + spectrum acquisition, autofocus.
+  Generated scripts use **only** this surface.
 - **Simulation** (`/api/simulation`, `SimulationHarness`) — twin-only test
   scaffolding with no real-HW equivalent: the sample registry and registration,
-  simulation environments, drift, beam damage, and contamination.
+  simulation environments, drift, beam damage, contamination, specimen
+  working-thickness selection, and the optional abTEM dynamical-diffraction
+  engine.
 
 ### Key Features
 
 | Feature | Description |
 |---------|-------------|
 | **Natural Language Interface** | Describe experiments in plain English, get executable code |
-| **STEM Digital Twin (v6)** | Unified diffraction from atomic positions; specimen realism |
-| **13-Sample Registry** | Crystals (FCC/BCC/HCP), polycrystals, dislocations, amorphous films, Au nanoparticle variants, core-shell, shape assemblies |
+| **STEM Digital Twin (v6+)** | Unified diffraction from atomic positions; specimen realism; thickness workflow |
+| **13-Sample Registry** | Fe FCC/BCC and Mg HCP crystals, polycrystals, dislocation fields, amorphous films, Au nanoparticle variants, core-shell, shape assemblies — all with schema-driven parameters and reproducibility seeds |
 | **Sample Registration** | Register a sample before imaging — like inserting a holder |
-| **Simulation Environments** | `pristine`, `beam_sensitive`, `contaminating`, `thick_drifting`, `low_dose` |
+| **Thickness Workflow** | Choose a working slab (1–100 nm) and a thickness seed deciding where in the specimen it sits |
+| **Simulation Environments** | `pristine`, `beam_sensitive`, `contaminating`, `thick_drifting`, `low_dose` — plus custom drift/damage/contamination overrides |
+| **EELS** | Single-spot spectra with composition-aware core-loss edges |
+| **Kinematical ⇄ abTEM** | Fast kinematical diffraction by default; optional dynamical multislice patterns (`pip install abtem`) computed on the same sample at the current stage tilt |
 | **Stage Safety Limits** | ±1.5 mm (x/y), ±1 mm (z), ±30° (tilt); out-of-range moves rejected |
+| **Session Seeds** | Copy/Load the exact state (sample, params, seeds, thickness, environment) as JSON |
 | **Sandboxed Execution** | Generated scripts run server-side in a subprocess — the exact code you would deploy |
 
 ---
@@ -93,24 +100,37 @@ Access the application at `http://localhost:5173`
 
 ## Usage
 
-### 1. Sample Settings (first window)
+### 1. Sample & Environment (first tab)
 
 Simulation-only configuration — nothing here exists on a real instrument:
 
-- **Sample registry**: pick one of 13 samples (descriptions from the server)
-- **Register**: builds the specimen volume and resets degradation history.
-  The microscope is disabled until a sample is registered.
-- **Environment**: bundle of realism settings (drift, damage, contamination, dose)
+- **Sample registry**: pick one of 13 samples; parameter controls are built
+  from each sample's `param_schema` (n_grains, n_dislocations, n_particles,
+  lattice constants, …) and pre-filled with its defaults
+- **Seeds**: structure/dislocation seeds with 🎲 randomize — the value stays
+  visible, and same seed + same params reproduces the sample bit-identically
+- **Thickness**: working-slab slider (1–100 nm) + thickness seed, with a
+  read-out of where the slab sits in the specimen
+- **Register / Load**: builds the specimen volume and resets degradation
+  history. The microscope is disabled until a sample is registered.
+- **Environment**: preset bundle of realism settings (each shows what it
+  sets), plus custom drift/damage/contamination/dwell expanders that
+  override the preset
 - **Fresh specimen**: clear accumulated beam damage / contamination
 
-### 2. Microscope Controls (second window)
+### 2. Microscope (second tab)
 
 The portable control surface — every action maps to a real instrument:
 
-- **Mode Toggle**: Imaging ↔ Diffraction (diffraction is computed from atoms; 1–5 s/frame)
+- **Mode Toggle**: Imaging ↔ Diffraction ↔ EELS (diffraction computed from
+  atoms, 1–5 s/frame; EELS renders as a line plot with labeled edges)
+- **Resolution**: 512 / 1024 / 2048 px windows (higher = finer detail, slower)
 - **Stage Control**: X/Y moves; rejected moves show the twin's safety-limit message
 - **Tilt Control**: α/β within ±30°
-- **Field of View / Magnification**: coupled controls (mag = k / FOV)
+- **Field of View / Magnification**: linked field pair (mag = k / FOV)
+- **Diffraction**: aperture / depth / camera length / beamstop, plus the
+  Kinematical ⇄ abTEM engine toggle with an explicit "Compute dynamical
+  pattern" button (greyed if `abtem` isn't installed on the backend)
 - **Beam Settings**: Voltage (60–300 kV) and Current (5–200 pA)
 - **Autofocus**: can legitimately fail to converge — the UI reports why
 
@@ -157,11 +177,16 @@ owns the instrument.
 | `/api/microscope/session` | GET | Polled snapshot: state + sample + run + log |
 | `/api/microscope/limits` | GET | Stage soft limits |
 | `/api/microscope/stage` | GET/POST | Stage position (400 on limit rejection) |
-| `/api/microscope/acquire` | POST | Acquire frame (IMG/DIFF) |
+| `/api/microscope/acquire` | POST | Acquire frame (IMG/DIFF, PNG payload) |
+| `/api/microscope/spectrum` | POST | Single-spot EELS spectrum |
+| `/api/microscope/resolution` | GET/POST | Discrete acquisition windows (512/1024/2048) |
+| `/api/microscope/diffraction` | GET/POST | Kinematical diffraction settings |
 | `/api/microscope/autofocus` | POST | Autofocus (reports `converged`) |
-| `/api/simulation/samples` | GET | Sample registry |
-| `/api/simulation/sample/register` | POST | Register the active sample |
+| `/api/simulation/samples` | GET | Sample registry (incl. `param_schema` + defaults) |
+| `/api/simulation/sample/register` | POST | Register the active sample (params, volume, thickness) |
+| `/api/simulation/thickness` | GET/POST | Working-thickness selection (409 without a sample) |
 | `/api/simulation/environment` | GET/POST | Simulation environment |
+| `/api/simulation/diffraction/abtem` | POST | Dynamical (multislice) SAED — 501 without `abtem`, cached per state |
 | `/api/execute/run` | POST | Run a script sandboxed (SSE stream) |
 | `/api/chat` | POST | AI assistant |
 | `/api/code/generate` | POST | Generate portable Python code |
