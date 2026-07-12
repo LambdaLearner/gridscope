@@ -48,7 +48,7 @@ class TestTransport:
         assert r["loaded"] == "fcc_single_crystal"
         img = control.acquire_image("haadf")
         assert isinstance(img, np.ndarray)
-        assert img.shape == (256, 256)
+        assert img.shape == (512, 512)
         assert img.dtype == np.uint16
 
     def test_limit_rejection_crosses_transport_as_error(self, control):

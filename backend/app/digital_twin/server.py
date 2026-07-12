@@ -102,6 +102,47 @@ def thickness_contrast(projected_sum, mfp_scale):
     return 1.0 - np.exp(-np.clip(projected_sum, 0, None) / max(1e-6, mfp_scale))
 
 
+def _render_atomic_columns(lattice, fov_nm, out_size, tilt_a_deg, tilt_b_deg,
+                           thickness_nm=4.0, probe_nm=0.05, max_atoms=250000):
+    """HAADF atomic-column image by PROJECTING real atoms (true Angstrom
+    positions) along the tilted beam. Physically correct columns (no aliasing),
+    and specimen tilt genuinely smears/splits them. Returns a normalized 2D image
+    in [0,1], or None."""
+    from .samples.base import tile_lattice_in_region
+    fov_A = fov_nm * 10.0
+    half_A = fov_A / 2.0
+    depth_A = max(4.0, thickness_nm * 10.0)
+    a1 = float(np.linalg.norm(lattice.real_vectors[0]))
+    c_len = abs(float(lattice.real_vectors[2][2])) or a1
+    est = (fov_A / a1) ** 2 * (depth_A / c_len) * max(1, len(lattice.basis))
+    if est > max_atoms:                      # thin the z-slab (columns repeat in z)
+        depth_A = max(a1, depth_A * max_atoms / est)
+    pos, Z = tile_lattice_in_region(lattice, half_A * 1.15, depth_A)
+    if len(pos) == 0:
+        return None
+    a = np.deg2rad(tilt_a_deg); b = np.deg2rad(tilt_b_deg)
+    Rx = np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+    Ry = np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]])
+    pos = pos @ (Ry @ Rx).T
+    px = (pos[:, 0] + half_A) / fov_A * out_size
+    py = (pos[:, 1] + half_A) / fov_A * out_size
+    w = (Z.astype(np.float64)) ** 1.7        # HAADF Z-contrast
+    m = (px >= 0) & (px < out_size) & (py >= 0) & (py < out_size)
+    ix = px[m].astype(np.intp); iy = py[m].astype(np.intp)
+    # fast scatter via bincount (np.add.at is ~100x slower for large arrays)
+    flat = iy * out_size + ix
+    img = np.bincount(flat, weights=w[m], minlength=out_size * out_size)
+    img = img.reshape(out_size, out_size)
+    try:
+        from scipy.ndimage import gaussian_filter
+        sigma_px = max(0.6, probe_nm / (fov_nm / out_size))
+        img = gaussian_filter(img, sigma=sigma_px)
+    except Exception:
+        pass
+    mx = img.max()
+    return (img / mx).astype(np.float32) if mx > 0 else None
+
+
 def kinematical_diffraction(lattice, out_size, tilt_a_deg, tilt_b_deg,
                             kv=200.0, camera_length_mm=800.0,
                             beamstop_radius_px=6.0, hkl_max=5,
@@ -231,10 +272,17 @@ def diffraction_from_atoms(positions_A, atomic_numbers, out_size,
     Rx = np.array([[1,0,0],[0,np.cos(a),-np.sin(a)],[0,np.sin(a),np.cos(a)]])
     Ry = np.array([[np.cos(b),0,np.sin(b)],[0,1,0],[-np.sin(b),0,np.cos(b)]])
     R = Ry @ Rx
-    beam = R @ np.array([0.0, 0.0, 1.0])
-    tmp = np.array([1.0, 0, 0]) if abs(beam[0]) < 0.9 else np.array([0, 1.0, 0])
-    e_x = np.cross(tmp, beam); e_x /= np.linalg.norm(e_x)
-    e_y = np.cross(beam, e_x)
+    # Tilt convention (matches a real double-tilt holder):
+    #   alpha = rotation about the HORIZONTAL (x) detector axis  -> Rx
+    #   beta  = rotation about the VERTICAL   (y) detector axis  -> Ry
+    # We rotate the SPECIMEN's reciprocal lattice by R and read it out on a FIXED
+    # detector frame (lab x,y). Using a fixed frame (rather than a beam-derived
+    # basis) is what makes alpha and beta act on perpendicular detector axes, as
+    # on a real instrument. The beam is along +z; the Ewald-sphere curvature uses
+    # q_z from the fixed detector (qx,qy).
+    beam = np.array([0.0, 0.0, 1.0])
+    e_x = np.array([1.0, 0.0, 0.0])
+    e_y = np.array([0.0, 1.0, 0.0])
 
     # Compute q-grid resolution. Note the diffracting region is kept ~cubic by
     # the sample's get_atoms_in_region (isotropic shape transform); with that,
@@ -250,6 +298,8 @@ def diffraction_from_atoms(positions_A, atomic_numbers, out_size,
             qy[:, :, None].astype(np.float32) * e_y[None, None, :].astype(np.float32) +
             q_z[:, :, None].astype(np.float32) * beam[None, None, :].astype(np.float32)
             ).reshape(Nq, 3)
+    # Rotate the specimen by R (tilt), so a fixed detector sees the tilted lattice.
+    positions_A = positions_A @ R.T
     positions_f32 = positions_A.astype(np.float32)
     chunk = max(64, min(Nq, int(2.5e7 / max(1, N))))
     A = np.zeros(Nq, dtype=np.complex64)
@@ -296,17 +346,26 @@ def diffraction_from_atoms(positions_A, atomic_numbers, out_size,
             yi = (np.arange(out_size) / rep).astype(int).clip(0, grid_eff - 1)
             xi = (np.arange(out_size) / rep).astype(int).clip(0, grid_eff - 1)
             I = I[yi][:, xi]
-    # Beamstop
+    # Direct (000) beam handling. The undiffracted beam is ~100x brighter than
+    # the Bragg spots and would saturate the display, hiding the spots. We
+    # normalize the pattern on the BRAGG spots (excluding the centre) and then
+    # REMOVE the direct beam entirely (set the central disk to zero) -- like a
+    # physical beam stop that blocks the undiffracted beam so only the diffracted
+    # spots remain. The removed radius is beamstop_radius_px.
     yy, xx = np.mgrid[0:out_size, 0:out_size].astype(np.float32)
     cx = cy = out_size / 2.0
     rr = np.sqrt((yy-cy)**2 + (xx-cx)**2)
-    if beamstop_radius_px > 0:
-        I[rr <= beamstop_radius_px] = 0.0
+    center_mask = rr <= max(1.0, beamstop_radius_px)
 
-    I = I - I.min()
-    mx = float(I.max())
+    outside = ~center_mask
+    I = I - (I[outside].min() if outside.any() else I.min())
+    I = np.clip(I, 0, None)
+    mx = float(I[outside].max()) if outside.any() else float(I.max())
     if mx > 1e-6:
         I = I / mx
+    I = np.clip(I, 0, 1.0)
+    # remove the direct beam (beam stop)
+    I[center_mask] = 0.0
     return np.clip(I * 65535.0, 0, 65535).astype(np.float32)
 
 
@@ -326,6 +385,12 @@ class SimMicroscope:
         "camera_length_mm": 800.0, "beamstop_radius_px": 6.0, "thickness_nm": 20.0,
         "aperture_um": 0.0, "depth_nm": 0.0,  # 0 = auto (use FOV / sample depth)
         "use_local_atoms": 1.0,  # 1=local-region from-atoms, 0=analytical kinematical
+    })
+    # NEW: specimen thickness selection (real-TEM thickness workflow). total = the
+    # specimen's full physical thickness; working = the slab imaged through; z_start
+    # = where that slab begins within the total (chosen by a seed at load time).
+    thickness: Dict[str, float] = field(default_factory=lambda: {
+        "total_nm": 100.0, "working_nm": 100.0, "z_start_nm": 0.0, "seed": 0,
     })
     # NEW: aberrations & optics
     optics: Dict[str, float] = field(default_factory=lambda: {"cs_mm": 1.0, "aperture_probe_px": 1.4})
@@ -352,7 +417,7 @@ class SimMicroscope:
 
 def default_haadf(detector_dict):
     detector_dict["haadf"] = {
-        "size": 256, "exposure": 0.1, "binning": 1,
+        "size": 512, "exposure": 0.1, "binning": 1,
         "field_of_view_um": 20.0, "noise_sigma": 12.0,
         # magnification is kept in sync with field_of_view_um (mag = MAG_K/fov_m)
         "magnification": MAG_K / (20.0 * 1e-6),
@@ -505,7 +570,8 @@ class STEMServer(object):
         self._log("get_current_sample", {}, r)
         return r
 
-    def load_sample(self, name, params=None, D=None, H=None, W=None):
+    def load_sample(self, name, params=None, D=None, H=None, W=None,
+                    thickness_nm=None, thickness_seed=None):
         params = params or {}
         D0, H0, W0 = self._default_DHW
         D = int(D) if D is not None else D0
@@ -523,6 +589,28 @@ class STEMServer(object):
             self.sample_fov_um = sample.sample_fov_um
             self.sample_px_per_um = W / self.sample_fov_um
             self.tilt_strength_px_per_slice = sample.tilt_strength_px_per_slice
+            # ---- thickness selection (replicates real-TEM thickness workflow) ----
+            # The specimen has a total physical thickness (sample.thickness_nm, e.g.
+            # 100 nm). At load time you choose a WORKING thickness to image through,
+            # and a SEED decides WHERE within the full thickness that slab sits --
+            # mimicking how local specimen thickness varies and where you land on
+            # the specimen is somewhat arbitrary. Environments may also set these.
+            total_t = float(getattr(sample, "thickness_nm", 100.0))
+            work_t = float(thickness_nm) if thickness_nm is not None else total_t
+            work_t = max(1.0, min(work_t, total_t))
+            seed = int(thickness_seed) if thickness_seed is not None else 0
+            # deterministic z-start offset within [0, total - work]
+            span = max(0.0, total_t - work_t)
+            frac = (np.random.default_rng(seed).random() if span > 0 else 0.0)
+            z_start = frac * span
+            self.sim.thickness = {
+                "total_nm": total_t,
+                "working_nm": work_t,
+                "z_start_nm": z_start,
+                "seed": seed,
+            }
+            # tie the diffraction thickness (relrod model) to the working thickness
+            self.sim.diff["thickness_nm"] = work_t
             self._calibrate_contrast()
             self._ready = True
             self._init_error = None
@@ -530,10 +618,42 @@ class STEMServer(object):
             self._init_error = traceback.format_exc()
             self._ready = prev_ready
             raise
-        r = {"loaded": name, "shape": [D, H, W], "params": sample.params}
-        self._log("load_sample", {"name": name, "params": params}, r)
-        print(f"[DT] Sample '{name}' loaded.")
+        r = {"loaded": name, "shape": [D, H, W], "params": sample.params,
+             "thickness": dict(self.sim.thickness)}
+        self._log("load_sample", {"name": name, "params": params,
+                                  "thickness_nm": thickness_nm,
+                                  "thickness_seed": thickness_seed}, r)
+        print(f"[DT] Sample '{name}' loaded. thickness={self.sim.thickness}")
         return r
+
+    def get_thickness(self):
+        """Return the current specimen thickness selection (total / working /
+        z-window start / seed), all in nm."""
+        r = dict(getattr(self.sim, "thickness",
+                         {"total_nm": 100.0, "working_nm": 100.0,
+                          "z_start_nm": 0.0, "seed": 0}))
+        self._log("get_thickness", {}, r)
+        return r
+
+    def set_thickness(self, thickness_nm=None, thickness_seed=None):
+        """Re-choose the working thickness and/or the seed WITHOUT reloading the
+        sample (e.g. to simulate navigating to a differently-thick region)."""
+        th = getattr(self.sim, "thickness", None)
+        if th is None or self.current_sample is None:
+            raise RuntimeError(NO_SAMPLE_MSG)
+        total_t = float(th["total_nm"])
+        work_t = float(thickness_nm) if thickness_nm is not None else float(th["working_nm"])
+        work_t = max(1.0, min(work_t, total_t))
+        seed = int(thickness_seed) if thickness_seed is not None else int(th["seed"])
+        span = max(0.0, total_t - work_t)
+        frac = (np.random.default_rng(seed).random() if span > 0 else 0.0)
+        self.sim.thickness = {"total_nm": total_t, "working_nm": work_t,
+                              "z_start_nm": frac * span, "seed": seed}
+        self.sim.diff["thickness_nm"] = work_t
+        self._log("set_thickness", {"thickness_nm": thickness_nm,
+                                    "thickness_seed": thickness_seed},
+                  dict(self.sim.thickness))
+        return dict(self.sim.thickness)
 
     # ---- beam ----
     def get_beam(self):
@@ -625,12 +745,96 @@ class STEMServer(object):
 
     def set_mode(self, mode="IMG"):
         m = str(mode).upper().strip()
-        if m not in ("IMG", "DIFF"):
-            raise ValueError("mode must be 'IMG' or 'DIFF'")
+        if m not in ("IMG", "DIFF", "EELS"):
+            raise ValueError("mode must be 'IMG', 'DIFF', or 'EELS'")
         self.sim.mode = m
         r = {"mode": m}
         self._log("set_mode", {"mode": mode}, r)
         return r
+
+    def acquire_spectrum(self, ev_min=0.0, ev_max=1000.0, n_channels=1024,
+                         cx_um=None, cy_um=None):
+        """Acquire a single-spot EELS spectrum (probe parked at one position).
+
+        This mirrors the 4D-STEM/EELS acquisition geometry: the focused probe sits
+        at ONE point and a 1-D spectrum is recorded. The spectrum here is a
+        physically-structured DUMMY (not quantitatively accurate): a zero-loss peak
+        at 0 eV, a plasmon peak in the low-loss region, and composition-aware
+        core-loss edges placed at approximate ionization energies of the elements
+        actually under the probe (from the sample's atoms). Intensities scale with
+        the working specimen thickness. The value is the WORKFLOW and the API
+        surface -- swap in a real EELS backend on a microscope later.
+
+        Returns {"energy_ev": [...], "intensity": [...], "edges": [{...}], ...}.
+        """
+        self._require_ready()
+        E = np.linspace(float(ev_min), float(ev_max), int(n_channels)).astype(np.float64)
+        spec = np.zeros_like(E)
+
+        # thickness scaling (thicker -> stronger plasmon relative to zero-loss)
+        th = getattr(self.sim, "thickness", {"working_nm": 100.0, "total_nm": 100.0})
+        t_nm = float(th.get("working_nm", 100.0))
+        t_over_lambda = t_nm / 100.0   # ~ t/inelastic-mean-free-path (order 1)
+
+        # (1) zero-loss peak (Gaussian at 0 eV)
+        zlp_w = 0.8
+        spec += np.exp(-0.5 * (E / zlp_w) ** 2)
+
+        # (2) plasmon peak(s): position depends loosely on material; single plasmon
+        #     around ~15-25 eV, amplitude grows with thickness (multiple scattering)
+        Zset = self._atoms_under_probe_Z(cx_um, cy_um)
+        Ep = 15.0 + 0.10 * (float(np.mean(Zset)) if len(Zset) else 15.0)  # crude
+        plasmon_amp = 0.35 * t_over_lambda
+        spec += plasmon_amp * np.exp(-0.5 * ((E - Ep) / 3.0) ** 2)
+        # double plasmon at 2*Ep for thicker specimens
+        spec += 0.4 * plasmon_amp**2 * np.exp(-0.5 * ((E - 2 * Ep) / 4.0) ** 2)
+
+        # (3) core-loss edges for the elements under the probe. Approximate edge
+        #     onset energies (eV) for a few common elements/edges.
+        EDGES = {
+            6:  [("C-K", 284)], 8: [("O-K", 532)], 12: [("Mg-K", 1305)],
+            13: [("Al-K", 1560)], 14: [("Si-K", 1839)], 22: [("Ti-L", 456)],
+            26: [("Fe-L", 708)], 29: [("Cu-L", 931)], 79: [("Au-M", 2206)],
+        }
+        edges_out = []
+        for Z in Zset:
+            for (name, e0) in EDGES.get(int(Z), []):
+                if E[0] <= e0 <= E[-1]:
+                    # saw-tooth edge: sharp onset then ~E^-r decay
+                    amp = 0.08 * t_over_lambda
+                    tail = np.where(E >= e0, amp * ((e0 / np.clip(E, e0, None)) ** 3), 0.0)
+                    spec += tail
+                    edges_out.append({"label": name, "onset_ev": e0, "Z": int(Z)})
+
+        # gentle decreasing background (power law) + Poisson-like noise
+        bg = 0.02 * np.clip((E + 5.0), 1, None) ** (-0.3)
+        spec = spec + bg
+        rng = np.random.default_rng(0)
+        spec = spec * (1.0 + 0.02 * rng.standard_normal(spec.shape))
+        spec = np.clip(spec, 0, None)
+
+        r = {"energy_ev": E.tolist(), "intensity": spec.tolist(),
+             "edges": edges_out, "zlp_ev": 0.0, "plasmon_ev": float(Ep),
+             "thickness_nm": t_nm, "elements_Z": sorted(int(z) for z in Zset)}
+        self._log("acquire_spectrum",
+                  {"ev_min": ev_min, "ev_max": ev_max, "n_channels": n_channels},
+                  f"EELS spectrum ({len(E)} ch, edges={[e['label'] for e in edges_out]})")
+        return r
+
+    def _atoms_under_probe_Z(self, cx_um=None, cy_um=None):
+        """Set of atomic numbers present in a small region under the probe, from
+        the current sample. Falls back to a light element if none available."""
+        s = getattr(self, "current_sample", None)
+        if s is None or not hasattr(s, "get_atoms_in_region"):
+            return np.array([6])   # carbon fallback
+        try:
+            cx = 0.0 if cx_um is None else float(cx_um)
+            cy = 0.0 if cy_um is None else float(cy_um)
+            _, Z = s.get_atoms_in_region(cx, cy, 0.01, 10.0)
+            Z = np.asarray(Z)
+            return np.unique(Z) if Z.size else np.array([6])
+        except Exception:
+            return np.array([6])
 
     def get_diffraction_settings(self):
         d = self.sim.diff
@@ -702,6 +906,30 @@ class STEMServer(object):
         self.detectors[device]["magnification"] = float(magnification)
         r = {"magnification": float(magnification), "field_of_view_um": fov_um}
         self._log("set_magnification", {"magnification": magnification, "device": device}, r)
+        return r
+
+    # Discrete acquisition resolutions (pixels per side), like a real STEM scan /
+    # camera: a small set of fixed windows. Higher resolution -> smaller pixel for
+    # the same field of view -> finer detail (e.g. atomic columns) resolves at a
+    # LOWER magnification, at the cost of longer acquisition (more scan points).
+    ALLOWED_RESOLUTIONS = (512, 1024, 2048)
+
+    def get_resolution(self, device="haadf"):
+        r = {"resolution_px": int(self.detectors[device]["size"]),
+             "allowed": list(self.ALLOWED_RESOLUTIONS)}
+        self._log("get_resolution", {"device": device}, r)
+        return r
+
+    def set_resolution(self, resolution_px, device="haadf"):
+        """Select one of the fixed acquisition resolution windows (pixels/side)."""
+        px = int(resolution_px)
+        if px not in self.ALLOWED_RESOLUTIONS:
+            raise ValueError(
+                f"resolution_px must be one of {list(self.ALLOWED_RESOLUTIONS)} "
+                f"(got {px}). Higher = finer detail resolvable at lower mag, but slower.")
+        self.detectors[device]["size"] = px
+        r = {"resolution_px": px, "allowed": list(self.ALLOWED_RESOLUTIONS)}
+        self._log("set_resolution", {"resolution_px": resolution_px, "device": device}, r)
         return r
 
     def get_stage(self):
@@ -796,9 +1024,18 @@ class STEMServer(object):
             self._last_acquire_t = now
             self.sim.drift["accum_x_px"] += self.sim.drift["vx_px_per_s"] * dt
             self.sim.drift["accum_y_px"] += self.sim.drift["vy_px_per_s"] * dt
-            # accumulated offset shifts the whole frame (between-frame drift)
-            cx = (cx + self.sim.drift["accum_x_px"]) % W
-            cy = (cy + self.sim.drift["accum_y_px"]) % H
+            # accumulated offset shifts the whole frame (between-frame drift).
+            # The sample is GENERATED over a large range (generation_range_um), so
+            # shifting the sampling window reveals adjacent, still-generated
+            # specimen -- as on a real instrument where drift moves you to a nearby
+            # region, not into blackness. We do NOT wrap modulo the volume (which
+            # would jump to the far edge / vacuum); we clamp so the window stays
+            # over generated specimen.
+            cx = float(cx + self.sim.drift["accum_x_px"])
+            cy = float(cy + self.sim.drift["accum_y_px"])
+            margin = 0.5 * fov_um * self.sample_px_per_um + 2
+            cx = min(max(cx, margin), W - margin)
+            cy = min(max(cy, margin), H - margin)
             # intra-frame drift (shear within one frame) computed from frame time
             frame_t = float(det["dwell_us"]) * 1e-6 * out_size * out_size
             intra_dx = self.sim.drift["vx_px_per_s"] * frame_t
@@ -825,6 +1062,11 @@ class STEMServer(object):
 
         # Item 4: thickness saturation + Z-contrast-ish nonlinearity already
         # baked into per-sample intensities. Convert raw sum -> scattering frac.
+        # Scale the projected mass-thickness by the WORKING thickness fraction:
+        # a thinner imaged slab passes fewer scatterers, so (in HAADF) less signal.
+        th = getattr(self.sim, "thickness", None)
+        if th is not None and float(th.get("total_nm", 0)) > 0:
+            proj = proj * (float(th["working_nm"]) / float(th["total_nm"]))
         signal = thickness_contrast(proj, self.mfp_scale)  # in [0,1)
 
         # Item 2: PSF convolution (defocus + aberrations)
@@ -862,6 +1104,40 @@ class STEMServer(object):
                 if sigma_px > 0.15:
                     from scipy.ndimage import gaussian_filter
                     signal = gaussian_filter(signal, sigma=sigma_px).astype(np.float32)
+
+        # High-resolution atomic columns for crystalline samples. A single crystal
+        # is a featureless slab at low/moderate magnification; only when the FOV is
+        # small enough to resolve the atomic-column spacing do columns appear -- as
+        # on a real HAADF instrument. We render the columns by PROJECTING the real
+        # atoms (true Angstrom positions from the lattice) along the TILTED beam,
+        # rather than synthesizing sinusoidal fringes. This (a) avoids the moire /
+        # aliasing that a pixel-space fringe pattern produces near Nyquist, (b) puts
+        # the columns at the correct spacing, and (c) makes specimen tilt (alpha/beta)
+        # genuinely smear/split the columns, as it does physically. Columns are only
+        # drawn when they are actually resolvable (spacing >= ~3.5 px); below that we
+        # keep the clean uniform slab (no aliased grid).
+        lat = getattr(self.current_sample, "lattice", None)
+        if lat is not None and nm_per_px > 0:
+            try:
+                a1_A = float(np.linalg.norm(lat.real_vectors[0]))   # Angstrom
+                d_nm = a1_A / 10.0
+                period_px = d_nm / nm_per_px
+                if period_px >= 3.5:   # only when cleanly resolvable (no aliasing)
+                    a_deg2 = float(self.sim.stage.get("a", 0.0))
+                    b_deg2 = float(self.sim.stage.get("b", 0.0))
+                    cols = _render_atomic_columns(
+                        lat, fov_um * 1000.0, out_size, a_deg2, b_deg2)
+                    if cols is not None:
+                        # blend columns into the slab signal where the sample exists
+                        local = np.clip(signal / (signal.max() + 1e-6), 0, 1)
+                        # ramp contrast in as columns become well-resolved
+                        w = float(np.clip((period_px - 3.5) / 4.0, 0.0, 1.0))
+                        cols = cols / (cols.max() + 1e-6)
+                        signal = signal * (1.0 - 0.6 * w * local) + \
+                                 signal.max() * 0.6 * w * cols * local
+                        signal = np.clip(signal, 0, None)
+            except Exception:
+                pass
 
         # voltage affects contrast slightly
         voltage_scale = max(0.1, min(3.0, voltage_kV / 200.0))
@@ -955,12 +1231,19 @@ class STEMServer(object):
                                       dqe=float(det["dqe"]),
                                       readout_e=float(det["readout_e"]),
                                       rng=rng)
-            # Per-frame normalization for display dynamic range. Damage/contam
-            # would be cancelled by this (a uniform attenuation rescales away), so
-            # we re-apply the degradation factor AFTER normalization: a degraded
-            # region/frame ends up genuinely darker than a pristine one.
-            mx = counts.max()
-            out = (counts / mx * 60000.0) if mx > 1e-6 else counts
+            # Damage/contamination would be cancelled by naive normalization (a
+            # uniform attenuation rescales away), so we re-apply the degradation
+            # factor AFTER normalization: a degraded region/frame ends up genuinely
+            # darker than a pristine one.
+            # Convert dose counts back to a displayable image. IMPORTANT: use a
+            # FIXED reference tied to the dose, not the per-frame max. Per-frame
+            # max-normalization stretches a low-contrast (uniform-slab) region's
+            # tiny shot noise across the full range, making a genuinely uniform
+            # crystal look like pure noise. Normalizing by the expected full-signal
+            # dose keeps a uniform bright region rendering as uniform bright gray,
+            # while real contrast (edges, particles, fringes) still spans the range.
+            ref = max(1e-6, dose_e * float(det["dqe"]))   # counts for signal==1.0
+            out = np.clip(counts / ref, 0.0, 1.2) * 60000.0
             if getattr(self, "_degradation_factor", None) is not None:
                 out = out * self._degradation_factor            # damage: darker
             if getattr(self, "_contam_brighten", None) is not None:
@@ -1017,11 +1300,14 @@ class STEMServer(object):
                 ap_um = float(self.sim.diff.get("aperture_um", 0.0))
                 if ap_um <= 0:
                     ap_um = float(det.get("field_of_view_um", 20.0))
-                # The illuminated region cannot exceed the specimen itself.
+                # The illuminated region cannot exceed the generated specimen.
                 # Without this clamp, a wide detector FOV on a small-extent
-                # sample (e.g. dislocation_crystal, 0.5 um) makes the atom
-                # tiling grid explode to tens of GB before the 100k cap runs.
-                ap_um = min(ap_um, float(self.sample_fov_um))
+                # sample makes the atom tiling grid explode to tens of GB
+                # before the 100k cap runs. Anchor to the sample's generation
+                # range (sample_fov_um is its legacy alias).
+                gen_um = float(getattr(self.current_sample, "generation_range_um",
+                                       self.sample_fov_um))
+                ap_um = min(ap_um, gen_um)
                 depth_nm = float(self.sim.diff.get("depth_nm", 0.0))
                 if depth_nm <= 0:
                     # full sample depth = D voxels * (sample_fov_um / W voxels) approximated
@@ -1209,6 +1495,17 @@ class STEMServer(object):
         for k, v in cfg["detector"].items():
             self.detectors["haadf"][k] = v
         self.sim.specimen["af_min_contrast"] = cfg["af_min_contrast"]
+        # Thickness is part of the environment too: some scenarios put you on a
+        # thick region, some on a thin one. Only applied if a sample is loaded.
+        env_thickness = {
+            "thick_drifting": dict(thickness_nm=90.0, thickness_seed=3),
+            "low_dose":       dict(thickness_nm=25.0, thickness_seed=5),
+        }
+        if name in env_thickness and getattr(self, "current_sample", None) is not None:
+            try:
+                self.set_thickness(**env_thickness[name])
+            except Exception:
+                pass
         self.reset_specimen()
         self._current_environment = name
         r = {"environment": name, "config": cfg}
@@ -1240,6 +1537,13 @@ class STEMServer(object):
                 "registered": self.vol is not None,
             },
             "stage_limits": {k: float(v) for k, v in self.STAGE_LIMITS.items()},
+            # inline (not via get_thickness/get_resolution) for the same
+            # command-log reason as diffraction above
+            "thickness": dict(self.sim.thickness),
+            "resolution": {
+                "resolution_px": int(self.detectors["haadf"]["size"]),
+                "allowed": list(self.ALLOWED_RESOLUTIONS),
+            },
         }
         return r
 

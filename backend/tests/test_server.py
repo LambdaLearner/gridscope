@@ -96,7 +96,7 @@ class TestSampleRegistry:
         r = fresh_server.load_sample(name, D=D, H=H, W=W)
         assert r["loaded"] == name
         img = fresh_server.acquire_image("haadf")
-        assert img["shape"] == (256, 256)
+        assert img["shape"] == (512, 512)
         assert img["dtype"] == "uint16"
 
     @pytest.mark.parametrize(
@@ -107,7 +107,7 @@ class TestSampleRegistry:
         fresh_server.load_sample(name, D=D, H=H, W=W)
         fresh_server.set_mode("DIFF")
         img = fresh_server.acquire_image("haadf")
-        assert img["shape"] == (256, 256)
+        assert img["shape"] == (512, 512)
 
     def test_unknown_sample_raises(self, server):
         with pytest.raises(KeyError, match="Unknown sample"):
@@ -305,3 +305,255 @@ class TestVolumeRelease:
         fresh_server.load_sample("bcc_single_crystal", D=D, H=H, W=W)
         assert fresh_server.vol.shape == (D, H, W)
         assert fresh_server.vol.dtype == np.float32
+
+
+# ---------------------------------------------------------------------------
+# Thickness workflow (v6+: working slab within the specimen's total thickness)
+# ---------------------------------------------------------------------------
+def _decode_u16(img_payload):
+    """Decode the serialize_ndarray_b64 payload back to a numpy array."""
+    import base64
+    raw = base64.b64decode(img_payload["__ndarray_b64__"])
+    return np.frombuffer(raw, dtype=img_payload["dtype"]).reshape(img_payload["shape"])
+
+
+class TestThicknessWorkflow:
+    def test_load_reports_thickness(self, fresh_server):
+        r = fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W,
+                                     thickness_nm=30.0, thickness_seed=7)
+        th = r["thickness"]
+        assert th["total_nm"] == pytest.approx(100.0)
+        assert th["working_nm"] == pytest.approx(30.0)
+        assert th["seed"] == 7
+        assert 0.0 <= th["z_start_nm"] <= 70.0
+
+    def test_default_load_uses_full_thickness(self, fresh_server):
+        r = fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        th = r["thickness"]
+        assert th["working_nm"] == pytest.approx(th["total_nm"])
+        assert th["z_start_nm"] == pytest.approx(0.0)
+
+    def test_set_thickness_without_sample_raises_no_sample(self, fresh_server):
+        with pytest.raises(RuntimeError, match="No sample registered"):
+            fresh_server.set_thickness(thickness_nm=30.0)
+
+    def test_working_thickness_clamped_to_total(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        th = fresh_server.set_thickness(thickness_nm=500.0)
+        assert th["working_nm"] == pytest.approx(th["total_nm"])
+        th = fresh_server.set_thickness(thickness_nm=0.0)
+        assert th["working_nm"] == pytest.approx(1.0)
+
+    def test_thickness_seed_deterministic(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        a = fresh_server.set_thickness(thickness_nm=30.0, thickness_seed=11)
+        b = fresh_server.set_thickness(thickness_nm=30.0, thickness_seed=11)
+        assert a["z_start_nm"] == pytest.approx(b["z_start_nm"])
+        c = fresh_server.set_thickness(thickness_nm=30.0, thickness_seed=12)
+        assert c["z_start_nm"] != pytest.approx(a["z_start_nm"])
+
+    def test_set_thickness_syncs_diffraction_relrod(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_thickness(thickness_nm=42.0)
+        assert fresh_server.get_diffraction_settings()["thickness_nm"] == pytest.approx(42.0)
+
+    def test_get_thickness_roundtrip(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W,
+                                 thickness_nm=25.0, thickness_seed=3)
+        th = fresh_server.get_thickness()
+        assert th["working_nm"] == pytest.approx(25.0)
+        assert th["seed"] == 3
+
+    def test_thinner_slab_gives_less_haadf_signal(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_thickness(thickness_nm=100.0)
+        thick = _decode_u16(fresh_server.acquire_image("haadf")).mean()
+        fresh_server.set_thickness(thickness_nm=5.0)
+        thin = _decode_u16(fresh_server.acquire_image("haadf")).mean()
+        assert thin < thick
+
+
+# ---------------------------------------------------------------------------
+# Resolution windows (discrete 512/1024/2048)
+# ---------------------------------------------------------------------------
+class TestResolutionWindows:
+    def test_default_resolution_is_512(self, fresh_server):
+        r = fresh_server.get_resolution()
+        assert r["resolution_px"] == 512
+        assert r["allowed"] == [512, 1024, 2048]
+
+    def test_set_resolution_changes_acquire_shape(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_resolution(1024)
+        img = fresh_server.acquire_image("haadf")
+        assert img["shape"] == (1024, 1024)
+        fresh_server.set_resolution(512)
+        img = fresh_server.acquire_image("haadf")
+        assert img["shape"] == (512, 512)
+
+    @pytest.mark.parametrize("bad", [256, 768, 4096, 0, -512])
+    def test_invalid_resolution_rejected_with_allowed_list(self, fresh_server, bad):
+        with pytest.raises(ValueError, match=r"512, 1024, 2048"):
+            fresh_server.set_resolution(bad)
+
+    def test_rejected_resolution_leaves_setting_unchanged(self, fresh_server):
+        before = fresh_server.get_resolution()["resolution_px"]
+        with pytest.raises(ValueError):
+            fresh_server.set_resolution(999)
+        assert fresh_server.get_resolution()["resolution_px"] == before
+
+
+# ---------------------------------------------------------------------------
+# EELS mode + single-spot spectrum
+# ---------------------------------------------------------------------------
+class TestEELS:
+    def test_eels_mode_accepted(self, fresh_server):
+        assert fresh_server.set_mode("EELS")["mode"] == "EELS"
+        assert fresh_server.get_mode()["mode"] == "EELS"
+
+    def test_acquire_spectrum_without_sample_raises_no_sample(self, fresh_server):
+        with pytest.raises(RuntimeError, match="No sample registered"):
+            fresh_server.acquire_spectrum()
+
+    def test_spectrum_shape_and_range(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        r = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=1000.0, n_channels=512)
+        assert len(r["energy_ev"]) == 512
+        assert len(r["intensity"]) == 512
+        assert r["energy_ev"][0] == pytest.approx(0.0)
+        assert r["energy_ev"][-1] == pytest.approx(1000.0)
+        assert min(r["intensity"]) >= 0.0
+
+    def test_fe_sample_shows_fe_edge(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        r = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=1000.0)
+        labels = [e["label"] for e in r["edges"]]
+        assert "Fe-L" in labels
+        assert 26 in r["elements_Z"]
+
+    def test_au_sample_shows_au_edge_in_extended_range(self, fresh_server):
+        fresh_server.load_sample("au_dispersed", D=D, H=H, W=W)
+        r = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=2500.0)
+        labels = [e["label"] for e in r["edges"]]
+        assert "Au-M" in labels
+
+    def test_edges_outside_range_omitted(self, fresh_server):
+        fresh_server.load_sample("au_dispersed", D=D, H=H, W=W)
+        r = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=500.0)
+        labels = [e["label"] for e in r["edges"]]
+        assert "Au-M" not in labels   # Au-M onset 2206 eV > 500 eV
+
+    def test_plasmon_scales_with_working_thickness(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_thickness(thickness_nm=100.0)
+        thick = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=60.0, n_channels=600)
+        fresh_server.set_thickness(thickness_nm=10.0)
+        thin = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=60.0, n_channels=600)
+        ep = thick["plasmon_ev"]
+        idx = int(round(ep / 60.0 * 599))
+        assert thick["intensity"][idx] > thin["intensity"][idx]
+
+
+# ---------------------------------------------------------------------------
+# Environments now carry a thickness component
+# ---------------------------------------------------------------------------
+class TestEnvironmentThickness:
+    def test_thick_drifting_sets_90nm(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_environment("thick_drifting")
+        assert fresh_server.get_thickness()["working_nm"] == pytest.approx(90.0)
+
+    def test_low_dose_sets_25nm(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_environment("low_dose")
+        assert fresh_server.get_thickness()["working_nm"] == pytest.approx(25.0)
+
+    def test_pristine_leaves_thickness_alone(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W,
+                                 thickness_nm=33.0)
+        fresh_server.set_environment("pristine")
+        assert fresh_server.get_thickness()["working_nm"] == pytest.approx(33.0)
+
+    def test_environment_without_sample_does_not_crash(self, fresh_server):
+        r = fresh_server.set_environment("thick_drifting")
+        assert r["environment"] == "thick_drifting"
+
+    def test_state_snapshot_includes_thickness_and_resolution(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W,
+                                 thickness_nm=40.0)
+        state = fresh_server.get_microscope_state()
+        assert state["thickness"]["working_nm"] == pytest.approx(40.0)
+        assert state["resolution"]["resolution_px"] in (512, 1024, 2048)
+        assert state["resolution"]["allowed"] == [512, 1024, 2048]
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility: same seeds => bit-identical specimen
+# ---------------------------------------------------------------------------
+class TestSeedDeterminism:
+    def test_same_structure_seed_bit_identical_volume(self, fresh_server):
+        fresh_server.load_sample("polycrystal_grains", params={"seed": 42, "n_grains": 5},
+                                 D=D, H=H, W=W)
+        vol_a = fresh_server.vol.copy()
+        fresh_server.load_sample("polycrystal_grains", params={"seed": 42, "n_grains": 5},
+                                 D=D, H=H, W=W)
+        assert np.array_equal(vol_a, fresh_server.vol)
+
+    def test_different_structure_seed_differs(self, fresh_server):
+        fresh_server.load_sample("polycrystal_grains", params={"seed": 42, "n_grains": 5},
+                                 D=D, H=H, W=W)
+        vol_a = fresh_server.vol.copy()
+        fresh_server.load_sample("polycrystal_grains", params={"seed": 43, "n_grains": 5},
+                                 D=D, H=H, W=W)
+        assert not np.array_equal(vol_a, fresh_server.vol)
+
+    def test_dislocation_seed_bit_identical_volume(self, fresh_server):
+        fresh_server.load_sample("dislocation_crystal",
+                                 params={"disl_seed": 9, "n_dislocations": 6},
+                                 D=D, H=H, W=W)
+        vol_a = fresh_server.vol.copy()
+        fresh_server.load_sample("dislocation_crystal",
+                                 params={"disl_seed": 9, "n_dislocations": 6},
+                                 D=D, H=H, W=W)
+        assert np.array_equal(vol_a, fresh_server.vol)
+
+
+# ---------------------------------------------------------------------------
+# Diffraction tilt convention (regression for the fixed-detector-frame fix)
+# ---------------------------------------------------------------------------
+class TestTiltConvention:
+    """The v6+ fix: the specimen is rotated and read out on a FIXED lab detector
+    frame, so alpha and beta act on perpendicular detector axes (like a real
+    double-tilt holder). Previously a beam-derived detector basis coupled them."""
+
+    @staticmethod
+    def _cubic_atoms(n=6, a=3.571):
+        """Simple-cubic block, symmetric under x<->y swap."""
+        from app.digital_twin.server import diffraction_from_atoms  # noqa: F401
+        coords = (np.arange(n) - (n - 1) / 2.0) * a
+        X, Y, Z3 = np.meshgrid(coords, coords, coords, indexing="ij")
+        pos = np.stack([X.ravel(), Y.ravel(), Z3.ravel()], axis=1)
+        Zn = np.full(len(pos), 26, dtype=np.int64)
+        return pos, Zn
+
+    def test_tilt_changes_pattern(self):
+        from app.digital_twin.server import diffraction_from_atoms
+        pos, Zn = self._cubic_atoms()
+        flat = diffraction_from_atoms(pos, Zn, 64, 0.0, 0.0)
+        tilted = diffraction_from_atoms(pos, Zn, 64, 8.0, 0.0)
+        assert not np.allclose(flat, tilted)
+
+    def test_alpha_beta_act_on_perpendicular_axes(self):
+        """For an x<->y symmetric specimen, an alpha tilt and a beta tilt must
+        produce patterns related by the same axis swap (transpose up to sign of
+        the angle) -- i.e. the two tilts are decoupled on the detector."""
+        from app.digital_twin.server import diffraction_from_atoms
+        pos, Zn = self._cubic_atoms()
+        I_a = diffraction_from_atoms(pos, Zn, 64, 6.0, 0.0)
+        candidates = [
+            diffraction_from_atoms(pos, Zn, 64, 0.0, 6.0).T,
+            diffraction_from_atoms(pos, Zn, 64, 0.0, -6.0).T,
+        ]
+        assert any(np.allclose(I_a, c, atol=200.0) for c in candidates), (
+            "alpha and beta tilts are not acting on perpendicular detector axes"
+        )

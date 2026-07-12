@@ -185,7 +185,7 @@ class TestEndToEnd:
         # Acquire now works and returns a PNG payload
         r = e2e_client.post("/api/microscope/acquire", json={"device": "haadf"})
         assert r.status_code == 200
-        assert r.json()["image"]["width"] == 256
+        assert r.json()["image"]["width"] == 512
 
     def test_real_limit_rejection_maps_to_400(self, e2e_client):
         r = e2e_client.post("/api/microscope/stage",
