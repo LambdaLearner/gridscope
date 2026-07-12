@@ -66,7 +66,6 @@ def generate_shapes_array(height=600, width=800, num_shapes=200, min_size=8,
 @register
 class ShapeAssembly(Sample):
     feature_scale_nm = 30.0   # smallest shape feature (~30 nm)
-    sample_fov_um = 5.0
     meta = SampleMetadata(
         name="shape_assembly",
         display_name="Shape Assembly (synthetic features)",

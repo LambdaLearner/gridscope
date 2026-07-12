@@ -25,19 +25,20 @@ def _rand_rot(seed):
 @register
 class PolycrystalGrains(Sample):
     feature_scale_nm = 0.25   # lattice fringe spacing (~0.25 nm)
-    sample_fov_um = 2.0
     meta = SampleMetadata(
         name="polycrystal_grains",
-        display_name="Polycrystal (FCC, few grains)",
+        display_name="Polycrystal (Fe FCC, few grains)",
         description="A few contiguous, differently-oriented FCC grains (Voronoi).",
         default_params={
             "n_grains": 4,
             "seed": 7,
-            "a_angstrom": 4.05,
-            "atomic_number": 79,
+            "a_angstrom": 3.571,  # gamma-Fe (austenite)
+            "atomic_number": 26,   # Fe
             "base_level": 90.0,
             "grain_intensity": 9000.0,
             "sigma_px": 1.1,
+            "max_tilt_deg": 0.0,   # 0 = grains on-zone (clean symmetric nets);
+                                   # >0 = realistic off-zone (sparse asymmetric)
         },
         param_schema={
             "n_grains":        {"type": "int",   "min": 2,    "max": 12},
@@ -47,6 +48,7 @@ class PolycrystalGrains(Sample):
             "base_level":      {"type": "float", "min": 0,    "max": 1000},
             "grain_intensity": {"type": "float", "min": 100,  "max": 60000},
             "sigma_px":        {"type": "float", "min": 0.5,  "max": 4.0},
+            "max_tilt_deg":    {"type": "float", "min": 0.0,  "max": 30.0},
         },
     )
     crystalline_particles = True
@@ -62,9 +64,10 @@ class PolycrystalGrains(Sample):
 
     def _grain_setup(self, H, W):
         """Grain seed points (in voxels) and a deterministic orientation each.
-        Orientations include a sizeable in-plane rotation so adjacent grains look
-        visibly different in the IMG view (rotated lattice rows) AND give distinct
-        diffraction patterns."""
+        Each grain gets a distinct in-plane rotation (about the beam) so adjacent
+        grains look different in IMG and give distinct, cleanly-symmetric spot
+        nets in DIFF. An optional out-of-plane tilt (param `max_tilt_deg`, default
+        0) can be enabled for a more realistic, off-zone polycrystal."""
         rng = np.random.default_rng(int(self.params["seed"]))
         ng = int(self.params["n_grains"])
         seeds_xy = np.column_stack([rng.uniform(0.1*W, 0.9*W, ng),
@@ -72,20 +75,32 @@ class PolycrystalGrains(Sample):
         rots = []
         # spread in-plane angles roughly evenly so grains are clearly different
         base_angles = np.linspace(0, np.pi/2, ng, endpoint=False) + rng.uniform(0, 0.3, ng)
+        max_tilt = np.deg2rad(float(self.params.get("max_tilt_deg", 0.0)))
         for g in range(ng):
-            # in-plane rotation (about beam z) -- dominates the visual + pattern
+            # In-plane rotation (about beam z). With max_tilt_deg == 0 this is the
+            # ONLY rotation, so every grain stays near a zone axis and a within-
+            # grain aperture gives a CLEAN, centrosymmetric single-crystal net --
+            # Friedel pairs (+g / -g) both visible. That is what makes the grain
+            # orientation legible in the DIFF view (Example 2, orientation mapping).
             th = base_angles[g]
             Rz = np.array([[np.cos(th), -np.sin(th), 0],
                            [np.sin(th),  np.cos(th), 0],
                            [0, 0, 1.0]])
-            # plus a small out-of-plane tilt (proper rotation, small angle)
-            r2 = np.random.default_rng(int(self.params["seed"]) * 100 + g)
-            ax = r2.normal(size=3); ax[2] = 0  # tilt axis in-plane -> tips z out
-            ax /= (np.linalg.norm(ax) + 1e-12)
-            phi = r2.uniform(0.0, 0.30)        # up to ~17 deg out-of-plane
-            K = np.array([[0,-ax[2],ax[1]],[ax[2],0,-ax[0]],[-ax[1],ax[0],0]])
-            Rtilt = np.eye(3) + np.sin(phi)*K + (1-np.cos(phi))*(K@K)
-            rots.append(Rz @ Rtilt)
+            # Optional out-of-plane tilt for a MORE REALISTIC polycrystal. When
+            # max_tilt_deg > 0, grains are thrown off-zone by up to that angle; the
+            # curved Ewald sphere then intersects only a few narrow relrods, so most
+            # grains show sparse, asymmetric patterns (often a single strong spot,
+            # its Friedel partner heavily suppressed). Default 0 keeps nets clean.
+            if max_tilt > 0.0:
+                r2 = np.random.default_rng(int(self.params["seed"]) * 100 + g)
+                ax = r2.normal(size=3); ax[2] = 0  # tilt axis in-plane -> tips z out
+                ax /= (np.linalg.norm(ax) + 1e-12)
+                phi = r2.uniform(0.0, max_tilt)
+                K = np.array([[0,-ax[2],ax[1]],[ax[2],0,-ax[0]],[-ax[1],ax[0],0]])
+                Rtilt = np.eye(3) + np.sin(phi)*K + (1-np.cos(phi))*(K@K)
+                rots.append(Rz @ Rtilt)
+            else:
+                rots.append(Rz)
         return seeds_xy, rots
 
     def _owner_at(self, x_vox, y_vox):
@@ -98,32 +113,34 @@ class PolycrystalGrains(Sample):
         self._seeds_xy, self._rots = self._grain_setup(H, W)
         self._vol_shape = (D, H, W)
 
-        V = np.zeros((D, H, W), dtype=np.float32) + float(p["base_level"])
-        # Render each grain's Voronoi region with a lattice-dot texture whose
-        # in-plane orientation matches that grain's rotation (so the IMG view
-        # visibly shows differently-oriented grains meeting at boundaries).
-        a_px = 20
+        # Grains render as roughly UNIFORM Voronoi patches with a small per-grain
+        # intensity offset (orientation/thickness contrast), NOT a visible atomic
+        # lattice -- atomic columns are sub-nm and cannot be shown in a coarse
+        # voxel volume. The crystallinity/orientation lives in the diffraction
+        # (get_atoms_in_region). This gives realistic grain-contrast imaging and
+        # per-grain diffraction, without an unphysical lattice visible at any FOV.
         gy, gx = np.mgrid[0:H, 0:W]
-        # Voronoi ownership per pixel
         d2 = ((gx[..., None] - self._seeds_xy[None, None, :, 0])**2 +
               (gy[..., None] - self._seeds_xy[None, None, :, 1])**2)
         owner = np.argmin(d2, axis=2)
         self._owner_map = owner.astype(np.int16)
 
+        base = float(p["base_level"])
+        slab = base + 40000.0            # bright specimen slab
+        V2d = np.full((H, W), slab, dtype=np.float32)
+        rng = np.random.default_rng(int(self.params["seed"]) + 99)
         for g in range(len(self._seeds_xy)):
             mask = (owner == g)
             if not mask.any():
                 continue
-            ang = np.arctan2(self._rots[g][1, 0], self._rots[g][0, 0])
-            ca, sa = np.cos(ang), np.sin(ang)
-            xr = gx * ca - gy * sa
-            yr = gx * sa + gy * ca
-            on = (((np.round(xr / a_px) - xr / a_px)**2 +
-                   (np.round(yr / a_px) - yr / a_px)**2) < 0.02) & mask
-            ys, xs = np.where(on)
-            for zz in range(D//2 - 6, D//2 + 6):
-                V[zz, ys, xs] += float(p["grain_intensity"])
+            # small per-grain contrast (+/- ~8%) from orientation/thickness
+            V2d[mask] = slab * (1.0 + 0.08 * rng.standard_normal())
+        # thin dark grain-boundary lines for a realistic look
+        from scipy.ndimage import sobel
+        edges = np.hypot(sobel(owner.astype(float), 0), sobel(owner.astype(float), 1))
+        V2d[edges > 0] *= 0.85
 
+        V = np.tile(V2d[None, :, :], (D, 1, 1)).astype(np.float32)
         def gfreq(n, s):
             f = np.fft.fftfreq(n).astype(np.float32)
             return np.exp(-2.0*(np.pi**2)*(s**2)*(f**2)).astype(np.float32)
@@ -144,10 +161,12 @@ class PolycrystalGrains(Sample):
         if not hasattr(self, "_seeds_xy"):
             return None, None
         D, H, W = self._vol_shape
-        px_per_um = W / self.sample_fov_um
-        rc_x = W/2.0 + cx_um * px_per_um   # region center in voxels
-        rc_y = H/2.0 + cy_um * px_per_um
-        half_vox = half_width_um * px_per_um
+        # lamella: x and y have different physical scales
+        px_per_um_x = W / self.sample_length_um
+        px_per_um_y = H / self.sample_width_um
+        rc_x = W/2.0 + cx_um * px_per_um_x   # region center in voxels
+        rc_y = H/2.0 + cy_um * px_per_um_y
+        half_vox = half_width_um * px_per_um_x
         depth_A = depth_nm * 10.0
 
         # Physical aperture size in Angstrom for the atom fill (compressed so the

@@ -11,6 +11,53 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 
 
+def make_lamella_slab(D, H, W, generation_range_um, sample_length_um,
+                      sample_width_um, base_level=90.0, slab_level=42000.0,
+                      edge_softness_px=6.0, texture=0.0, seed=0):
+    """Build a uniform FIB-lamella slab volume for CRYSTAL samples.
+
+    A single crystal in HAADF at low/moderate magnification is a roughly UNIFORM
+    slab (mass-thickness contrast), NOT a visible lattice -- atomic columns are
+    ~0.2 nm apart and cannot be rendered in a coarse voxel volume (a voxel here is
+    tens of nm). So we render the specimen as a bright slab of the lamella's
+    lateral size (sample_length_um x sample_width_um) sitting in vacuum, with soft
+    edges. The crystallinity lives entirely in the DIFFRACTION path (real Angstrom
+    lattice via get_atoms_in_region). This fixes the old bug where a fake dot
+    lattice at ~600 nm spacing was visible at every magnification.
+
+    The lateral pixel scale is set by generation_range_um (the physical width the
+    W axis spans). The slab occupies the central sample_length x sample_width; the
+    rest is vacuum (dark), so panning past the lamella edge shows vacuum, as on a
+    real TEM.
+    """
+    px_per_um = W / float(generation_range_um)
+    V = np.full((D, H, W), float(base_level), dtype=np.float32)
+    # lamella footprint in pixels, centred
+    half_len_px = 0.5 * float(sample_length_um) * px_per_um
+    half_wid_px = 0.5 * float(sample_width_um) * px_per_um
+    cx, cy = W / 2.0, H / 2.0
+    X = np.arange(W)[None, :] - cx
+    Y = np.arange(H)[:, None] - cy
+    # soft-edged rectangular footprint (smoothstep at the edges)
+    def soft(d, half, s):
+        return np.clip(0.5 - (np.abs(d) - half) / max(1e-6, s) * 0.5 + 0.5, 0.0, 1.0)
+    fx = np.clip((half_len_px - np.abs(X)) / max(1e-6, edge_softness_px) + 0.5, 0.0, 1.0)
+    fy = np.clip((half_wid_px - np.abs(Y)) / max(1e-6, edge_softness_px) + 0.5, 0.0, 1.0)
+    footprint = (fx * fy).astype(np.float32)   # (H, W) in [0,1]
+    slab = base_level + slab_level * footprint
+    if texture > 0:
+        rng = np.random.default_rng(seed)
+        # gentle large-scale thickness/mass texture (not a lattice)
+        t = rng.normal(0, 1, (max(4, H // 32), max(4, W // 32))).astype(np.float32)
+        from numpy.fft import fft2, ifft2
+        t = np.real(ifft2(fft2(t)))
+        t = np.kron(t, np.ones((H // t.shape[0] + 1, W // t.shape[1] + 1)))[:H, :W]
+        t = (t - t.mean()) / (t.std() + 1e-6)
+        slab = slab * (1.0 + texture * t * footprint)
+    V[:] = slab[None, :, :]
+    return np.clip(V, 0, 65535).astype(np.float32)
+
+
 @dataclass
 class SampleMetadata:
     name: str
@@ -57,7 +104,26 @@ class CrystalLattice:
 
 class Sample:
     meta: SampleMetadata = None
-    sample_fov_um: float = 200.0
+    # ------------------------------------------------------------------
+    # Physical specimen geometry: a FIB-lamella-like slab. The volume's W
+    # (x) axis spans `sample_length_um`, H (y) spans `sample_width_um`, and
+    # D (z) spans `thickness_nm`. Moving the stage beyond the lamella edges
+    # shows VACUUM (no signal), as on a real TEM. `sample_fov_um` is kept as
+    # a backward-compatible alias for the length.
+    # ------------------------------------------------------------------
+    sample_length_um: float = 20.0    # lamella length  (x / W axis)
+    sample_width_um: float = 5.0      # lamella width   (y / H axis)
+    thickness_nm: float = 100.0       # lamella thickness (z / D axis); can be
+                                      # overridden at load_sample or by the
+                                      # simulation environment
+    # `generation_range_um` is the physical width the volume's W axis spans (the
+    # extent over which the sample is GENERATED). It is deliberately >= the
+    # largest imaging FOV you intend to use, so imaging within it never hits the
+    # generated edge. This is NOT the imaging field of view (that is set per
+    # acquisition via device_settings/magnification). `sample_fov_um` is kept as a
+    # backward-compatible alias.
+    generation_range_um: float = 20.0
+    sample_fov_um: float = 20.0       # legacy alias (= generation_range_um)
     # Inherent length scale of the sample's finest meaningful detail, in
     # nanometres. Used by the server as a resolution limit: when the current
     # pixel size (FOV / magnification) is coarser than this, the fine detail is
@@ -74,6 +140,17 @@ class Sample:
     def __init__(self, **params):
         defaults = self.meta.default_params if self.meta else {}
         self.params = {**defaults, **params}
+        # Keep the legacy alias and the new name in sync (subclasses may set
+        # either as a class attribute). generation_range_um is authoritative.
+        gr = getattr(type(self), "generation_range_um", None)
+        fv = getattr(type(self), "sample_fov_um", None)
+        # instance value: prefer an explicitly set generation_range_um, else fov
+        val = gr if gr is not None else (fv if fv is not None else 20.0)
+        # if a subclass overrode sample_fov_um but not generation_range_um, honor it
+        if fv is not None and gr == Sample.generation_range_um and fv != Sample.sample_fov_um:
+            val = fv
+        self.generation_range_um = float(val)
+        self.sample_fov_um = float(val)
 
     def generate_volume(self, D, H, W):
         raise NotImplementedError

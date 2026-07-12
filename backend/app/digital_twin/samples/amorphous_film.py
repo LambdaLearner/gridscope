@@ -13,7 +13,6 @@ from . import register
 @register
 class AmorphousFilm(Sample):
     feature_scale_nm = 0.3   # nearest-neighbour distance (~0.3 nm)
-    sample_fov_um = 0.5
     meta = SampleMetadata(
         name="amorphous_film",
         display_name="Amorphous Film",
