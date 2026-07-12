@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter
 from pydantic import BaseModel, Field, model_validator
 
+from ..services import abtem_service
 from ..services import twin_session as ts
 
 router = APIRouter(prefix="/simulation", tags=["simulation"])
@@ -75,6 +76,17 @@ class DriftSettings(BaseModel):
 class SetThicknessRequest(BaseModel):
     thickness_nm: Optional[float] = Field(None, gt=0.0, le=1000.0)
     thickness_seed: Optional[int] = Field(None, ge=0, le=MAX_SEED)
+
+
+class AbtemDiffractionRequest(BaseModel):
+    # >0 adds thermal-diffuse background; each config multiplies runtime.
+    num_frozen_phonons: int = Field(0, ge=0, le=abtem_service.MAX_FROZEN_PHONONS)
+    half_width_um: float = Field(0.02, gt=0.0, le=1.0)
+    depth_nm: float = Field(10.0, gt=0.0, le=200.0)
+    # Extraction box; the service also enforces its own hard maxima.
+    max_lateral_A: float = Field(50.0, gt=0.0, le=abtem_service.MAX_LATERAL_A)
+    max_thickness_A: float = Field(80.0, gt=0.0, le=abtem_service.MAX_THICKNESS_A)
+    max_angle_mrad: float = Field(60.0, ge=10.0, le=120.0)
 
 
 # ===== Endpoints =====
@@ -172,6 +184,29 @@ def set_specimen(settings: SpecimenSettings):
 def reset_specimen():
     ts.require_idle()
     return {"success": True, **ts.twin_call(ts.get_harness().reset_specimen)}
+
+
+@router.get("/diffraction/abtem/availability")
+def abtem_availability():
+    """Whether the optional abtem/ase dependencies are installed. The UI greys
+    the Kinematical⇄abTEM toggle when unavailable."""
+    return abtem_service.availability()
+
+
+@router.post("/diffraction/abtem")
+def compute_abtem_diffraction(request: AbtemDiffractionRequest):
+    """Compute a dynamical (multislice) SAED pattern for the registered sample
+    at the current stage tilt and beam voltage. Long-running (seconds to tens
+    of seconds); one computation at a time (409 while busy); 501 when abtem is
+    not installed. Results are cached on the full state fingerprint."""
+    return abtem_service.compute_saed(
+        num_frozen_phonons=request.num_frozen_phonons,
+        half_width_um=request.half_width_um,
+        depth_nm=request.depth_nm,
+        max_lateral_A=request.max_lateral_A,
+        max_thickness_A=request.max_thickness_A,
+        max_angle_mrad=request.max_angle_mrad,
+    )
 
 
 @router.get("/drift")

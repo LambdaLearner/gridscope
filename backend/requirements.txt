@@ -12,6 +12,14 @@ scipy>=1.11
 ase>=3.22
 pillow>=10.0
 
+# Optional: dynamical (multislice) diffraction path. Without it the
+# /simulation/diffraction/abtem endpoint returns 501 and the UI greys the
+# Kinematical⇄abTEM toggle.
+#   Python 3.10: pip install abtem==1.0.6   (1.0.8+ needs Python >= 3.11,
+#                and 1.0.5 and older break on NumPy 2 / lack fixes)
+#   Python 3.11+: pip install abtem
+# abtem==1.0.6
+
 # Tests
 pytest>=8.0
 httpx>=0.26
