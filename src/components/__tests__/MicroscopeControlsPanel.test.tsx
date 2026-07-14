@@ -306,3 +306,104 @@ describe('MicroscopeControlsPanel — v6+ features', () => {
     expect(twin.acquireImage).not.toHaveBeenCalled();
   });
 });
+
+describe('MicroscopeControlsPanel — v2 addenda (z, Live, TIFF, dose meter)', () => {
+  it('displays the live z read-out and nudges focus via relative z moves', async () => {
+    const withZ: SessionSnapshot = {
+      ...SESSION,
+      state: { ...SESSION.state!, stage: { ...SESSION.state!.stage, z: 1.75e-6 } },
+    };
+    render(
+      <MicroscopeControlsPanel session={withZ} sampleRegistered={true} runActive={false} />,
+    );
+    expect(screen.getByTestId('z-readout').textContent).toMatch(/\+1\.75 µm/);
+    fireEvent.click(screen.getByTitle('Fine focus +0.25 µm'));
+    await waitFor(() => {
+      expect(twin.setStagePosition).toHaveBeenCalledWith({ z: 0.25e-6 }, true);
+    });
+  });
+
+  it('Save TIFF is disabled until a frame exists, then links the capture download', async () => {
+    render(
+      <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    const save = screen.getByRole('button', { name: /TIFF/i }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /^Acquire$/i }));
+    await waitFor(() => expect(twin.acquireImage).toHaveBeenCalled());
+    expect((screen.getByRole('button', { name: /TIFF/i }) as HTMLButtonElement).disabled)
+      .toBe(false);
+  });
+
+  it('Live toggle starts continuous acquisition and disables single Acquire', async () => {
+    render(
+      <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /^Live$/i }));
+    await waitFor(() => expect(twin.acquireImage).toHaveBeenCalled());
+    expect(screen.getByText('LIVE')).toBeTruthy();
+    expect((screen.getByRole('button', { name: /^Acquire$/i }) as HTMLButtonElement).disabled)
+      .toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /Stop live/i }));
+    await waitFor(() => {
+      expect(screen.queryByText('LIVE')).toBeNull();
+    });
+  });
+
+  it('Live stops itself when an acquire fails', async () => {
+    vi.mocked(twin.acquireImage).mockRejectedValue(new ApiError(503, 'twin down'));
+    render(
+      <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /^Live$/i }));
+    await waitFor(() => {
+      expect(screen.queryByText('LIVE')).toBeNull();
+    });
+  });
+
+  it('shows the dose meter when damage is enabled, with accumulated vs critical dose', () => {
+    const withDose: SessionSnapshot = {
+      ...SESSION,
+      state: {
+        ...SESSION.state!,
+        specimen: {
+          beam_damage_enabled: 1, contamination_enabled: 0,
+          damage_dose_threshold: 3e4, max_accumulated_dose: 1.5e4,
+          max_contamination: 0,
+        },
+      },
+    };
+    render(
+      <MicroscopeControlsPanel session={withDose} sampleRegistered={true} runActive={false} />,
+    );
+    const meter = screen.getByTestId('dose-meter');
+    expect(meter.textContent).toMatch(/1\.5e\+4/);
+    expect(meter.textContent).toMatch(/critical 3\.0e\+4/);
+  });
+
+  it('hides the dose meter when neither damage nor contamination is on', () => {
+    const noDose: SessionSnapshot = {
+      ...SESSION,
+      state: {
+        ...SESSION.state!,
+        specimen: {
+          beam_damage_enabled: 0, contamination_enabled: 0,
+          damage_dose_threshold: 3e4, max_accumulated_dose: 0, max_contamination: 0,
+        },
+      },
+    };
+    render(
+      <MicroscopeControlsPanel session={noDose} sampleRegistered={true} runActive={false} />,
+    );
+    expect(screen.queryByTestId('dose-meter')).toBeNull();
+  });
+
+  it('offers the standard voltages as a dropdown', () => {
+    render(
+      <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    const select = screen.getByLabelText('Accelerating voltage') as HTMLSelectElement;
+    const values = Array.from(select.options).map((o) => o.value);
+    expect(values).toEqual(['60', '80', '120', '200', '300']);
+  });
+});

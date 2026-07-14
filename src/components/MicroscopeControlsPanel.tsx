@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Camera,
+  Download,
   Focus,
+  Radio,
   ZoomIn,
   ZoomOut,
   Move,
@@ -26,6 +28,7 @@ import {
 import {
   acquireImage,
   acquireSpectrum,
+  captureTiffUrl,
   runAutofocus,
   setStagePosition,
   setDetectorSettings,
@@ -76,8 +79,12 @@ export function MicroscopeControlsPanel({
   const [fov, setFov] = useState(20);
   const [moveStep, setMoveStep] = useState(5);
   const [tiltStep, setTiltStep] = useState(5);
-  const [beamCurrent, setBeamCurrent] = useState(50);
+  const [beamCurrent, setBeamCurrent] = useState(80);
   const [beamVoltage, setBeamVoltage] = useState(200);
+  // Live mode (spec rev 4): re-acquire continuously; the recommended way to
+  // see drift, since the twin advances drift by real elapsed time per frame.
+  const [live, setLive] = useState(false);
+  const liveRef = useRef(false);
   // EELS
   const [spectrum, setSpectrum] = useState<SpectrumResult | null>(null);
   const [evMin, setEvMin] = useState(0);
@@ -112,6 +119,45 @@ export function MicroscopeControlsPanel({
       .then((r) => setAbtemAvailable(r.available))
       .catch(() => setAbtemAvailable(false));
   }, [connected, abtemAvailable]);
+
+  // Live loop: adaptive cadence — the next acquire starts only after the
+  // previous frame returns (never overlapping calls), floored at ~300 ms.
+  useEffect(() => {
+    liveRef.current = live;
+    if (!live) return;
+    let cancelled = false;
+    (async () => {
+      while (!cancelled && liveRef.current) {
+        const t0 = performance.now();
+        try {
+          const result = await acquireImage('haadf');
+          if (cancelled || !liveRef.current) break;
+          setCurrentImage(`data:image/png;base64,${result.image.image_base64}`);
+          setAbtemMeta(null);
+          setImageInfo({
+            x_um: result.stage.x_um, y_um: result.stage.y_um,
+            fov_um: result.settings?.field_of_view_um ?? fov,
+            a: result.stage.a, b: result.stage.b, mode: result.mode,
+          });
+        } catch {
+          setLive(false);
+          break;
+        }
+        const elapsed = performance.now() - t0;
+        await new Promise((r) => setTimeout(r, Math.max(300 - elapsed, 0)));
+      }
+      onAcquired?.();
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [live]);
+
+  // Live only makes sense for image modes while the instrument is available.
+  useEffect(() => {
+    if (live && (imagingMode === 'EELS' || !connected || !sampleRegistered || runActive)) {
+      setLive(false);
+    }
+  }, [live, imagingMode, connected, sampleRegistered, runActive]);
 
   const classifyError = (e: unknown, fallback: string): PanelError => {
     if (e instanceof ApiError) {
@@ -222,23 +268,43 @@ export function MicroscopeControlsPanel({
       }
     }, 'Autofocus failed');
 
+  // While Live is running, movement handlers skip their own re-acquire —
+  // the live loop picks up the new position on its next frame.
   const handleMove = (dxUm: number, dyUm: number) =>
     runAction('Moving stage...', async () => {
       await setStagePosition({ x: dxUm * 1e-6, y: dyUm * 1e-6 }, true);
-      await doAcquire();
+      if (!liveRef.current) await doAcquire();
     }, 'Failed to move stage');
 
   const handleTilt = (da: number, db: number) =>
     runAction('Tilting...', async () => {
       await setStagePosition({ a: tiltA + da, b: tiltB + db }, false);
-      await doAcquire();
+      if (!liveRef.current) await doAcquire();
     }, 'Failed to set tilt');
 
   const handleResetTilt = () =>
     runAction('Resetting tilt...', async () => {
       await setStagePosition({ a: 0, b: 0 }, false);
-      await doAcquire();
+      if (!liveRef.current) await doAcquire();
     }, 'Failed to reset tilt');
+
+  // z focus nudge (spec A1): fine steps change focus/PSF; coarse navigates.
+  const handleFocus = (dzUm: number) =>
+    runAction('Adjusting focus (z)...', async () => {
+      await setStagePosition({ z: dzUm * 1e-6 }, true);
+      if (!liveRef.current) await doAcquire();
+    }, 'Failed to adjust focus');
+
+  const handleSaveTiff = () => {
+    // The backend stashes the most-recent raw frame; this streams it as a
+    // 32-bit float TIFF download with embedded acquisition metadata.
+    const a = document.createElement('a');
+    a.href = captureTiffUrl();
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
 
   const handleFovChange = (newFov: number) => {
     setFov(newFov);
@@ -407,6 +473,13 @@ export function MicroscopeControlsPanel({
           </div>
         )}
 
+        {live && (
+          <div className="absolute top-10 right-2 bg-red-600/90 text-white text-[10px] px-2 py-0.5 rounded-full flex items-center gap-1 font-semibold tracking-wider">
+            <Radio className="w-3 h-3 animate-pulse" />
+            LIVE
+          </div>
+        )}
+
         {isLoading && (
           <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
             <div className="flex items-center gap-2 text-cyan-400">
@@ -422,21 +495,76 @@ export function MicroscopeControlsPanel({
         <div className="flex gap-2">
           <button
             onClick={handleAcquire}
-            disabled={!controlsEnabled}
+            disabled={!controlsEnabled || live}
             className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 bg-cyan-600 hover:bg-cyan-700 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-lg transition-colors text-sm font-medium"
           >
             <Camera className="w-4 h-4" />
             Acquire
           </button>
+          {imagingMode !== 'EELS' && (
+            <button
+              onClick={() => setLive((v) => !v)}
+              disabled={!connected || !sampleRegistered || runActive}
+              title="Continuously re-acquire (~300 ms cadence, never overlapping). The recommended way to watch drift."
+              className={`flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg transition-colors text-sm font-medium ${
+                live
+                  ? 'bg-red-600 hover:bg-red-700 text-white'
+                  : 'bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:bg-slate-700 disabled:text-slate-500'
+              }`}
+            >
+              <Radio className={`w-4 h-4 ${live ? 'animate-pulse' : ''}`} />
+              {live ? 'Stop live' : 'Live'}
+            </button>
+          )}
           <button
             onClick={handleAutofocus}
-            disabled={!controlsEnabled}
+            disabled={!controlsEnabled || live}
             className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 bg-violet-600 hover:bg-violet-700 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-lg transition-colors text-sm font-medium"
           >
             <Focus className="w-4 h-4" />
             Autofocus
           </button>
+          <button
+            onClick={handleSaveTiff}
+            disabled={!connected || (!currentImage && !abtemMeta)}
+            title="Download the most-recent frame as a 32-bit float TIFF with embedded acquisition metadata"
+            className="flex items-center justify-center gap-2 px-3 py-2.5 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-700 disabled:text-slate-500 text-slate-200 rounded-lg transition-colors text-sm"
+          >
+            <Download className="w-4 h-4" />
+            TIFF
+          </button>
         </div>
+
+        {/* Dose meter (spec A5): accumulated dose vs the critical dose */}
+        {state?.specimen &&
+          (state.specimen.beam_damage_enabled >= 0.5 ||
+            state.specimen.contamination_enabled >= 0.5) && (
+          <div className="text-[11px] text-slate-400 bg-slate-900/60 rounded-lg px-3 py-2 font-mono flex items-center gap-3"
+               data-testid="dose-meter">
+            <span className="text-amber-400">dose</span>
+            <span>
+              {state.specimen.max_accumulated_dose.toExponential(1)} e⁻/Å²
+              {state.specimen.beam_damage_enabled >= 0.5 && (
+                <> / critical {state.specimen.damage_dose_threshold.toExponential(1)}</>
+              )}
+            </span>
+            {state.specimen.beam_damage_enabled >= 0.5 && (
+              <div className="flex-1 h-1.5 bg-slate-700 rounded overflow-hidden">
+                <div
+                  className={`h-full ${
+                    state.specimen.max_accumulated_dose >= state.specimen.damage_dose_threshold
+                      ? 'bg-red-500' : 'bg-amber-500'
+                  }`}
+                  style={{
+                    width: `${Math.min(100,
+                      (state.specimen.max_accumulated_dose /
+                        Math.max(1, state.specimen.damage_dose_threshold)) * 100)}%`,
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Resolution windows (discrete, like a real scan generator) */}
         <div className="space-y-1.5">
@@ -557,6 +685,59 @@ export function MicroscopeControlsPanel({
               </button>
               <div />
             </div>
+          </div>
+        </div>
+
+        {/* Focus (z) — spec A1: value always displayed; fine steps change the
+            PSF (manual focus companion to Autofocus), coarse steps navigate. */}
+        <div className="space-y-2 pt-2 border-t border-slate-700">
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-slate-400 flex items-center gap-1">
+              <Focus className="w-4 h-4" />
+              Focus (z)
+              <span className="text-[10px] text-slate-600">(fine ±5 µm · hard ±1000 µm)</span>
+            </span>
+            <span
+              className="text-xs text-cyan-300 font-mono bg-slate-700 px-2 py-0.5 rounded"
+              data-testid="z-readout"
+            >
+              z = {((state?.stage?.z ?? 0) * 1e6) >= 0 ? '+' : ''}
+              {((state?.stage?.z ?? 0) * 1e6).toFixed(2)} µm
+            </span>
+          </div>
+          <div className="grid grid-cols-4 gap-1.5">
+            <button
+              onClick={() => handleFocus(-25)}
+              disabled={!controlsEnabled}
+              title="Coarse focus −25 µm"
+              className="px-2 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs text-white font-mono transition-colors"
+            >
+              −25
+            </button>
+            <button
+              onClick={() => handleFocus(-0.25)}
+              disabled={!controlsEnabled}
+              title="Fine focus −0.25 µm"
+              className="px-2 py-1.5 bg-slate-700 hover:bg-cyan-700 disabled:opacity-50 rounded text-xs text-white font-mono transition-colors"
+            >
+              −0.25
+            </button>
+            <button
+              onClick={() => handleFocus(0.25)}
+              disabled={!controlsEnabled}
+              title="Fine focus +0.25 µm"
+              className="px-2 py-1.5 bg-slate-700 hover:bg-cyan-700 disabled:opacity-50 rounded text-xs text-white font-mono transition-colors"
+            >
+              +0.25
+            </button>
+            <button
+              onClick={() => handleFocus(25)}
+              disabled={!controlsEnabled}
+              title="Coarse focus +25 µm"
+              className="px-2 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs text-white font-mono transition-colors"
+            >
+              +25
+            </button>
           </div>
         </div>
 
@@ -800,20 +981,22 @@ export function MicroscopeControlsPanel({
                 <Zap className="w-3 h-3 text-yellow-400" />
                 Voltage
               </span>
-              <span className="text-yellow-400 font-mono bg-slate-700 px-2 py-0.5 rounded">{beamVoltage} kV</span>
+              <select
+                value={beamVoltage}
+                onChange={(e) => {
+                  const kv = Number(e.target.value);
+                  setBeamVoltage(kv);
+                  handleBeamChange(beamCurrent, kv);
+                }}
+                disabled={!controlsEnabled}
+                aria-label="Accelerating voltage"
+                className="bg-slate-700 text-yellow-400 font-mono text-xs rounded px-2 py-1 border-none focus:ring-1 focus:ring-yellow-500 disabled:opacity-50"
+              >
+                {[60, 80, 120, 200, 300].map((kv) => (
+                  <option key={kv} value={kv}>{kv} kV</option>
+                ))}
+              </select>
             </div>
-            <input
-              type="range"
-              min="60"
-              max="300"
-              step="10"
-              value={beamVoltage}
-              onChange={(e) => setBeamVoltage(Number(e.target.value))}
-              onMouseUp={() => handleBeamChange(beamCurrent, beamVoltage)}
-              onTouchEnd={() => handleBeamChange(beamCurrent, beamVoltage)}
-              disabled={!controlsEnabled}
-              className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-yellow-500 disabled:opacity-50"
-            />
           </div>
 
           <div className="space-y-1">
@@ -826,9 +1009,9 @@ export function MicroscopeControlsPanel({
             </div>
             <input
               type="range"
-              min="5"
-              max="200"
-              step="5"
+              min="1"
+              max="500"
+              step="1"
               value={beamCurrent}
               onChange={(e) => setBeamCurrent(Number(e.target.value))}
               onMouseUp={() => handleBeamChange(beamCurrent, beamVoltage)}
@@ -836,6 +1019,9 @@ export function MicroscopeControlsPanel({
               disabled={!controlsEnabled}
               className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-orange-500 disabled:opacity-50"
             />
+            <div className="flex justify-between text-[10px] text-slate-600">
+              <span>noisy (dose-limited)</span><span>clean</span>
+            </div>
           </div>
         </div>
 

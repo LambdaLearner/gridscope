@@ -6,7 +6,7 @@
  * backend's control/simulation split.
  */
 
-import { apiGet, apiPost } from './client';
+import { API_BASE_URL, apiGet, apiPost } from './client';
 
 // Magnification <-> field-of-view calibration: mag = MAG_K / fov_metres.
 // Same constant as the twin server (57 kx <-> 1.6564523008 µm).
@@ -65,6 +65,26 @@ export interface ResolutionInfo {
   allowed: number[];
 }
 
+export interface DriftStateSnapshot {
+  vx_px_per_s: number;
+  vy_px_per_s: number;
+  vx_nm_per_s: number;
+  vy_nm_per_s: number;
+  accum_x_px: number;
+  accum_y_px: number;
+  line_jitter_px: number;
+  enabled: number;
+  max_dt_s: number;
+}
+
+export interface SpecimenSnapshot {
+  beam_damage_enabled: number;
+  contamination_enabled: number;
+  damage_dose_threshold: number;
+  max_accumulated_dose: number;
+  max_contamination: number;
+}
+
 export interface MicroscopeState {
   stage: { x: number; y: number; z: number; a: number; b: number };
   beam: BeamSettings;
@@ -79,6 +99,8 @@ export interface MicroscopeState {
   stage_limits: StageLimits;
   thickness?: ThicknessState;
   resolution?: ResolutionInfo;
+  drift?: DriftStateSnapshot;
+  specimen?: SpecimenSnapshot;
 }
 
 export interface SpectrumEdge {
@@ -271,6 +293,21 @@ export function setBeamSettings(
   relative = false,
 ): Promise<{ success: boolean; new_beam: BeamSettings }> {
   return apiPost('/microscope/beam', { settings, relative });
+}
+
+export interface CaptureInfo {
+  has_image: boolean;
+  meta?: Record<string, unknown>;
+  filename?: string;
+}
+
+export function getCaptureInfo(): Promise<CaptureInfo> {
+  return apiGet('/microscope/capture');
+}
+
+/** URL for the 32-bit TIFF download of the most-recent acquisition. */
+export function captureTiffUrl(name?: string): string {
+  return `${API_BASE_URL}/microscope/capture.tiff${name ? `?name=${encodeURIComponent(name)}` : ''}`;
 }
 
 export function startDigitalTwinServer(): Promise<{ status: string; port: number }> {
