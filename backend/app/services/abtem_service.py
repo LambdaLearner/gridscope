@@ -25,6 +25,7 @@ from fastapi import HTTPException
 from ..digital_twin import abtem_engine
 from ..digital_twin import samples as samples_pkg
 from . import twin_session as ts
+from .capture import store as capture_store
 
 # Server-side hard maxima on the extraction box: multislice cost grows with
 # atom count, and there is no safe way to kill a CPU-bound compute thread —
@@ -171,6 +172,19 @@ def compute_saed(num_frozen_phonons: int = 0,
             num_frozen_phonons=int(num_frozen_phonons),
             max_angle_mrad=float(max_angle_mrad),
         )
+        # Stash the RAW dynamical pattern for "Save 32-bit TIFF" (A4): the
+        # quantitative float intensities, tagged so the filename/metadata
+        # distinguish it from kinematical frames.
+        capture_store.stash(pattern, meta={
+            "mode": "DIFF",
+            "engine": "abTEM",
+            "sample": current["name"],
+            "params": state["params"],
+            "tilt_a_deg": a_deg,
+            "tilt_b_deg": b_deg,
+            "voltage_kV": energy_kev,
+            "num_frozen_phonons": int(num_frozen_phonons),
+        })
         u16 = abtem_engine.AbtemDiffraction.display_u16(pattern)
         result = {
             "success": True,
