@@ -400,18 +400,19 @@ class SimMicroscope:
         "accum_x_px": 0.0, "accum_y_px": 0.0,      # accumulated offset
         "line_jitter_px": 0.0,
         "enabled": 0.0,
+        "max_dt_s": 2.0,   # cap on per-frame elapsed time (idle-jump guard)
     })
     # NEW: beam damage + contamination (specimen-degradation effects)
     specimen: Dict[str, float] = field(default_factory=lambda: {
         # beam damage: cumulative dose above 'damage_dose_threshold' (e-/A^2)
         # progressively removes signal in the exposed region.
         "beam_damage_enabled": 0.0,
-        "damage_dose_threshold": 5.0e3,    # e-/A^2 before damage onset
-        "damage_rate": 1.0,                # how fast contrast is lost past threshold
+        "damage_dose_threshold": 3.0e4,    # e-/A^2 critical dose (moderately robust)
+        "damage_rate": 1.0,                # contrast-loss speed for dose past threshold
         # contamination: carbon builds up where the beam dwells, darkening the
         # image and adding diffuse background to diffraction over time.
         "contamination_enabled": 0.0,
-        "contamination_rate": 1.0,         # growth per unit exposure
+        "contamination_rate": 1.0,         # carbon build-up rate (0-5 typical)
     })
 
 
@@ -700,8 +701,20 @@ class STEMServer(object):
         return r
 
     def set_drift(self, vx_px_per_s=None, vy_px_per_s=None, line_jitter_px=None,
-                  enabled=None, reset_accum=False):
+                  enabled=None, reset_accum=False,
+                  vx_nm_per_s=None, vy_nm_per_s=None, line_jitter_nm=None):
+        """Set stage drift. PREFER the physical nm/s interface (vx_nm_per_s,
+        vy_nm_per_s) and line_jitter_nm -- these are TEM-realistic units and are
+        converted to the internal volume-pixel rates using the current volume
+        scale. Realistic magnitudes: excellent < 0.2 nm/s, good ~0.5, moderate ~2,
+        poor/just-inserted ~5, and ~10 nm/s is about the worst a usable session
+        shows. The px/s arguments remain for backward compatibility."""
         d = self.sim.drift
+        # volume pixels per nm (accum/velocities live in volume-pixel space)
+        px_per_nm = float(getattr(self, "sample_px_per_um", 38.4)) / 1000.0
+        if vx_nm_per_s is not None: d["vx_px_per_s"] = float(vx_nm_per_s) * px_per_nm
+        if vy_nm_per_s is not None: d["vy_px_per_s"] = float(vy_nm_per_s) * px_per_nm
+        if line_jitter_nm is not None: d["line_jitter_px"] = float(line_jitter_nm) * px_per_nm
         if vx_px_per_s is not None: d["vx_px_per_s"] = float(vx_px_per_s)
         if vy_px_per_s is not None: d["vy_px_per_s"] = float(vy_px_per_s)
         if line_jitter_px is not None: d["line_jitter_px"] = float(line_jitter_px)
@@ -710,7 +723,12 @@ class STEMServer(object):
             d["accum_x_px"] = 0.0; d["accum_y_px"] = 0.0
             self._last_acquire_t = time.time()
         r = {k: float(d[k]) for k in d}
-        self._log("set_drift", {"vx": vx_px_per_s, "vy": vy_px_per_s}, r)
+        # report physical rates too, for the GUI
+        nm_per_px = (1.0 / px_per_nm) if px_per_nm > 0 else 26.04
+        r["vx_nm_per_s"] = d["vx_px_per_s"] * nm_per_px
+        r["vy_nm_per_s"] = d["vy_px_per_s"] * nm_per_px
+        self._log("set_drift", {"vx_nm_per_s": vx_nm_per_s, "vy_nm_per_s": vy_nm_per_s,
+                                "vx_px_per_s": vx_px_per_s, "vy_px_per_s": vy_px_per_s}, r)
         return r
 
     # ---- specimen degradation (NEW: beam damage + contamination) ----
@@ -1020,7 +1038,12 @@ class STEMServer(object):
         intra_dx = intra_dy = 0.0
         if not for_autofocus and self.sim.drift.get("enabled", 0.0) >= 0.5:
             now = time.time()
+            # cap dt so that a long idle gap (e.g. the sample sits loaded while the
+            # user reads the panel, then acquires) does not teleport the field in a
+            # single huge jump -- on a real scope you'd re-center before starting.
+            # Live/continuous acquisition sees smooth, physically-correct drift.
             dt = max(0.0, now - self._last_acquire_t)
+            dt = min(dt, float(self.sim.drift.get("max_dt_s", 2.0)))
             self._last_acquire_t = now
             self.sim.drift["accum_x_px"] += self.sim.drift["vx_px_per_s"] * dt
             self.sim.drift["accum_y_px"] += self.sim.drift["vy_px_per_s"] * dt
@@ -1164,15 +1187,25 @@ class STEMServer(object):
             gx1 = int(np.clip((cxn + half_f) * g, 0, g-1)) + 1
             gy0 = int(np.clip((cyn - half_f) * g, 0, g-1))
             gy1 = int(np.clip((cyn + half_f) * g, 0, g-1)) + 1
-            # Exposure increment per acquisition. Tuned so a typical frame adds a
-            # modest fraction of the damage threshold -> gradual damage over
-            # several frames rather than instantaneous saturation.
-            inc = (current_pA / 100.0) * (float(det.get("dwell_us", 10.0)) / 20.0) * 300.0
+            # Exposure increment per acquisition, in REAL electrons/A^2 (the unit
+            # damage_dose_threshold is expressed in). This correctly depends on
+            # probe current, dwell time, AND the pixel size on the specimen, which
+            # is set by FOV and RESOLUTION: dose = electrons_per_pixel / pixel_area,
+            # pixel_area = (FOV/resolution)^2. So a smaller FOV or a higher
+            # resolution concentrates dose and damages faster -- as on a real
+            # instrument. (Earlier builds used an arbitrary unit that ignored this.)
+            _dwell_s = float(det.get("dwell_us", 20.0)) * 1e-6
+            _e_per_px = (current_pA * 1e-12 / 1.602e-19) * _dwell_s
+            _pix_nm = (fov_um * 1000.0) / max(1, out_size)      # nm per acquisition pixel
+            _pix_A2 = max(1e-6, (_pix_nm * 10.0) ** 2)          # A^2 per pixel
+            inc = _e_per_px / _pix_A2                            # e-/A^2 added this frame
             if not for_autofocus and (gx1 > gx0) and (gy1 > gy0):
                 if damage_on:
                     self._dose_map[gy0:gy1, gx0:gx1] += inc
                 if contam_on:
-                    self._contam_map[gy0:gy1, gx0:gx1] += (inc / 300.0) * float(sp.get("contamination_rate",1.0))
+                    # contamination grows with exposure (per-frame dwell-dose), scaled
+                    # by the contamination_rate; independent of the damage threshold.
+                    self._contam_map[gy0:gy1, gx0:gx1] += (inc / 3.0e3) * float(sp.get("contamination_rate", 1.0))
             from scipy.ndimage import zoom as _zoom
             def _patch_to_out(maparr):
                 patch = maparr[gy0:gy1, gx0:gx1]
@@ -1192,9 +1225,16 @@ class STEMServer(object):
             self._contam_brighten = None
             if damage_on:
                 dose_patch = _patch_to_out(self._dose_map)
-                thr = float(sp.get("damage_dose_threshold", 5e3))
+                thr = float(sp.get("damage_dose_threshold", 3e4))
                 rate = float(sp.get("damage_rate", 1.0))
-                excess = np.clip(dose_patch - thr, 0, None) / max(1.0, thr)
+                # Gradual contrast loss once cumulative dose exceeds the critical
+                # dose. Use the LOG of the dose ratio so damage progresses smoothly
+                # over many frames (a few % to tens of % per frame) rather than
+                # collapsing the instant the threshold is passed. Real dose can be
+                # >> threshold at small FOV/high dose, so a linear ratio would
+                # saturate immediately; log keeps it controllable and realistic.
+                ratio = np.clip(dose_patch / max(1.0, thr), 1.0, None)
+                excess = np.log10(ratio)                       # 0 at threshold, 1 at 10x
                 self._degradation_factor *= np.exp(-rate * excess).astype(np.float32)
             if contam_on:
                 contam_patch = _patch_to_out(self._contam_map)
@@ -1452,37 +1492,47 @@ class STEMServer(object):
         This is the 'simulation environment' a user selects to stress-test their
         code under specific conditions without changing the specimen itself."""
         name = str(name).lower().strip()
+        # Drift is specified through the PHYSICAL nm/s interface so presets stay
+        # correct for any sample's volume scale (the notebook hard-coded px/s
+        # values pre-computed for the default scale; nm/s is the same intent,
+        # scale-independent). Realistic anchors: excellent <0.2 · good ~0.5 ·
+        # moderate ~2 · poor ~5 nm/s.
         presets = {
             "pristine": {  # ideal conditions: no drift, no damage, high dose
-                "drift": dict(vx_px_per_s=0, vy_px_per_s=0, line_jitter_px=0, enabled=False),
+                "drift": dict(vx_nm_per_s=0.0, vy_nm_per_s=0.0, line_jitter_nm=0.0,
+                              enabled=False),  # ~0 nm/s (excellent)
                 "specimen": dict(beam_damage_enabled=False, contamination_enabled=False),
                 "detector": dict(dwell_us=20.0, dqe=0.9, readout_e=1.0),
                 "af_min_contrast": 0.05,
             },
             "beam_sensitive": {  # damage accumulates quickly; AF can diverge
-                "drift": dict(vx_px_per_s=2, vy_px_per_s=1, line_jitter_px=0.3, enabled=True),
+                "drift": dict(vx_nm_per_s=0.4, vy_nm_per_s=0.25, line_jitter_nm=0.05,
+                              enabled=True),  # ~0.5 nm/s (good)
                 "specimen": dict(beam_damage_enabled=True, contamination_enabled=False,
-                                 damage_dose_threshold=4.0e3, damage_rate=0.7),
+                                 damage_dose_threshold=1.0e4, damage_rate=0.8),
                 "detector": dict(dwell_us=10.0, dqe=0.8, readout_e=1.5),
                 "af_min_contrast": 0.12,
             },
             "contaminating": {  # carbon builds up where the beam dwells
-                "drift": dict(vx_px_per_s=3, vy_px_per_s=2, line_jitter_px=0.4, enabled=True),
+                "drift": dict(vx_nm_per_s=1.0, vy_nm_per_s=0.6, line_jitter_nm=0.1,
+                              enabled=True),  # ~1.2 nm/s (moderate)
                 "specimen": dict(beam_damage_enabled=False, contamination_enabled=True,
                                  contamination_rate=3.0),
                 "detector": dict(dwell_us=15.0, dqe=0.8, readout_e=1.5),
                 "af_min_contrast": 0.10,
             },
             "thick_drifting": {  # thick noisy sample with strong drift
-                "drift": dict(vx_px_per_s=12, vy_px_per_s=7, line_jitter_px=1.0, enabled=True),
+                "drift": dict(vx_nm_per_s=5.0, vy_nm_per_s=3.0, line_jitter_nm=0.3,
+                              enabled=True),  # ~5.8 nm/s (poor/fresh insert)
                 "specimen": dict(beam_damage_enabled=False, contamination_enabled=False),
                 "detector": dict(dwell_us=6.0, dqe=0.7, readout_e=2.5),
                 "af_min_contrast": 0.10,
             },
             "low_dose": {  # dose-limited: very noisy, AF struggles
-                "drift": dict(vx_px_per_s=4, vy_px_per_s=2, line_jitter_px=0.5, enabled=True),
+                "drift": dict(vx_nm_per_s=1.5, vy_nm_per_s=0.9, line_jitter_nm=0.15,
+                              enabled=True),  # ~1.7 nm/s (moderate, dose-limited)
                 "specimen": dict(beam_damage_enabled=True, contamination_enabled=False,
-                                 damage_dose_threshold=2.5e3, damage_rate=0.8),
+                                 damage_dose_threshold=5.0e3, damage_rate=1.0),
                 "detector": dict(dwell_us=2.0, dqe=0.75, readout_e=2.0),
                 "af_min_contrast": 0.15,
             },
@@ -1544,8 +1594,28 @@ class STEMServer(object):
                 "resolution_px": int(self.detectors["haadf"]["size"]),
                 "allowed": list(self.ALLOWED_RESOLUTIONS),
             },
+            # drift with physical nm/s echo + dose meter fields, so the 2 s poll
+            # carries everything the GUI displays without extra RPC loops
+            "drift": self._drift_state_with_nm(),
+            "specimen": {
+                "beam_damage_enabled": float(self.sim.specimen.get("beam_damage_enabled", 0.0)),
+                "contamination_enabled": float(self.sim.specimen.get("contamination_enabled", 0.0)),
+                "damage_dose_threshold": float(self.sim.specimen.get("damage_dose_threshold", 3e4)),
+                "max_accumulated_dose": (float(self._dose_map.max())
+                                         if self._dose_map is not None else 0.0),
+                "max_contamination": (float(self._contam_map.max())
+                                      if self._contam_map is not None else 0.0),
+            },
         }
         return r
+
+    def _drift_state_with_nm(self):
+        d = {k: float(v) for k, v in self.sim.drift.items()}
+        px_per_nm = float(getattr(self, "sample_px_per_um", 38.4)) / 1000.0
+        nm_per_px = (1.0 / px_per_nm) if px_per_nm > 0 else 26.04
+        d["vx_nm_per_s"] = d["vx_px_per_s"] * nm_per_px
+        d["vy_nm_per_s"] = d["vy_px_per_s"] * nm_per_px
+        return d
 
     def close(self):
         self._log("close", {}, 1)
