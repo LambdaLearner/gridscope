@@ -12,10 +12,12 @@ FastAPI runs sync handlers in its threadpool, keeping the event loop free.
 import threading
 from typing import Any, Dict, Literal, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
 
 from ..services import twin_session as ts
+from ..services.capture import store as capture_store
 
 router = APIRouter(prefix="/microscope", tags=["microscope"])
 
@@ -308,6 +310,22 @@ def acquire_image(request: AcquireImageRequest):
     control = ts.get_control()
     arr = ts.twin_call(control.acquire_image, request.device)
     state = ts.twin_call(control.get_microscope_state)
+    # Stash the raw frame + context for the on-demand "Save 32-bit TIFF"
+    # action (O(1) memory: only the most-recent frame is kept).
+    det = state.get("detectors", {}).get(request.device, {})
+    capture_store.stash(arr, meta={
+        "mode": state.get("mode"),
+        "sample": (state.get("sample") or {}).get("name"),
+        "engine": "kinematical" if state.get("mode") == "DIFF" else None,
+        "mag_kx": float(det.get("magnification", 0.0)) / 1e3,
+        "resolution": int(det.get("size", 0)),
+        "field_of_view_um": float(det.get("field_of_view_um", 0.0)),
+        "thickness_nm": (state.get("thickness") or {}).get("working_nm"),
+        "tilt_a_deg": state["stage"]["a"],
+        "tilt_b_deg": state["stage"]["b"],
+        "voltage_kV": state["beam"]["voltage_kV"],
+        "current_pA": state["beam"]["current_pA"],
+    })
     return {
         "success": True,
         "device": request.device,
@@ -323,6 +341,33 @@ def acquire_image(request: AcquireImageRequest):
         "sample": state["sample"],
         "settings": state.get("detectors", {}).get(request.device),
     }
+
+
+@router.get("/capture")
+def get_capture_info():
+    """Whether a frame is stashed for saving, plus its context and the
+    filename a download would get."""
+    if not capture_store.has_image():
+        return {"has_image": False}
+    meta = capture_store.meta()
+    return {"has_image": True, "meta": meta,
+            "filename": f"{capture_store.auto_name(meta)}.tif"}
+
+
+@router.get("/capture.tiff")
+def download_capture_tiff(name: Optional[str] = None):
+    """Download the most-recent acquisition as a 32-bit float TIFF with the
+    acquisition context embedded (ImageJ-readable). 404 if nothing has been
+    acquired yet."""
+    try:
+        payload, filename, media_type = capture_store.build_tiff(name=name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(
+        content=payload,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/autofocus")

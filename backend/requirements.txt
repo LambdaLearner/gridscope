@@ -11,6 +11,7 @@ numpy>=1.26
 scipy>=1.11
 ase>=3.22
 pillow>=10.0
+tifffile>=2024.0   # 32-bit float TIFF export ("Save TIFF" capture path)
 
 # Optional: dynamical (multislice) diffraction path. Without it the
 # /simulation/diffraction/abtem endpoint returns 501 and the UI greys the
