@@ -6,7 +6,7 @@
 
 ## Overview
 
-GridScope is an AI-powered automation platform for Scanning Transmission Electron Microscopy (STEM) that bridges the gap between experimental design and instrument execution. Researchers describe imaging objectives in natural language—such as *"acquire a 5×5 grid at 3 µm spacing"* or *"explore tilt angles from 0° to 30°"*—and receive executable Python scripts validated against a physics-based Digital Twin (v6+, ported from `Digital_twin_revised/STEM_Digital_Twin_Modular_final_w_PyJEM_with_abTEM.ipynb`; GUI per `STEM_Twin_GUI_Build_Spec.md`).
+GridScope is an AI-powered automation platform for Scanning Transmission Electron Microscopy (STEM) that bridges the gap between experimental design and instrument execution. Researchers describe imaging objectives in natural language—such as *"acquire a 5×5 grid at 3 µm spacing"* or *"explore tilt angles from 0° to 30°"*—and receive executable Python scripts validated against a physics-based Digital Twin (v6+, ported from `Digital_twin_revised_v2/STEM_Digital_Twin_Modular_final_w_PyJEM_with_abTEM.ipynb`; GUI per `Digital_twin_revised_v2/STEM_Twin_GUI_Build_Spec.md` incl. addenda A1–A6).
 
 ### The control / simulation split
 
@@ -33,6 +33,9 @@ The system keeps two surfaces strictly apart, so what you test here deploys ther
 | **Sample Registration** | Register a sample before imaging — like inserting a holder |
 | **Thickness Workflow** | Choose a working slab (1–100 nm) and a thickness seed deciding where in the specimen it sits |
 | **Simulation Environments** | `pristine`, `beam_sensitive`, `contaminating`, `thick_drifting`, `low_dose` — plus custom drift/damage/contamination overrides |
+| **Realistic Physics Units** | Drift in physical nm/s (0–10, wall-clock time, idle-jump guard); damage/contamination driven by real electron dose (e⁻/Å², depends on FOV × resolution × current × dwell) with a log-gradual critical-dose model |
+| **Live Mode + Dose Meter** | Continuous adaptive acquisition (the way to watch drift) and an accumulated-dose read-out against the critical dose |
+| **32-bit TIFF Export** | One-click download of the most-recent frame (kinematical or abTEM) as quantitative float TIFF with embedded ImageJ-readable metadata |
 | **EELS** | Single-spot spectra with composition-aware core-loss edges |
 | **Kinematical ⇄ abTEM** | Fast kinematical diffraction by default; optional dynamical multislice patterns (`pip install abtem`) computed on the same sample at the current stage tilt |
 | **Stage Safety Limits** | ±1.5 mm (x/y), ±1 mm (z), ±30° (tilt); out-of-range moves rejected |
@@ -124,9 +127,17 @@ The portable control surface — every action maps to a real instrument:
 
 - **Mode Toggle**: Imaging ↔ Diffraction ↔ EELS (diffraction computed from
   atoms, 1–5 s/frame; EELS renders as a line plot with labeled edges)
+- **Live Mode**: continuous adaptive acquisition (~300 ms cadence, never
+  overlapping) — drift advances with real wall-clock time, so this is how
+  you watch it; damage/contamination accumulate per frame
 - **Resolution**: 512 / 1024 / 2048 px windows (higher = finer detail, slower)
 - **Stage Control**: X/Y moves; rejected moves show the twin's safety-limit message
+- **Focus (z)**: live read-out with fine (±0.25 µm) and coarse (±25 µm) steps —
+  fine steps visibly change sharpness (manual companion to Autofocus)
 - **Tilt Control**: α/β within ±30°
+- **Save TIFF**: downloads the most-recent frame as 32-bit float TIFF with the
+  acquisition context embedded (mode, sample, mag, resolution, thickness, tilt)
+- **Dose meter**: accumulated e⁻/Å² under the beam vs the critical dose
 - **Field of View / Magnification**: linked field pair (mag = k / FOV)
 - **Diffraction**: aperture / depth / camera length / beamstop, plus the
   Kinematical ⇄ abTEM engine toggle with an explicit "Compute dynamical
@@ -181,6 +192,7 @@ owns the instrument.
 | `/api/microscope/spectrum` | POST | Single-spot EELS spectrum |
 | `/api/microscope/resolution` | GET/POST | Discrete acquisition windows (512/1024/2048) |
 | `/api/microscope/diffraction` | GET/POST | Kinematical diffraction settings |
+| `/api/microscope/capture.tiff` | GET | Download the most-recent frame as 32-bit TIFF (404 before first acquire) |
 | `/api/microscope/autofocus` | POST | Autofocus (reports `converged`) |
 | `/api/simulation/samples` | GET | Sample registry (incl. `param_schema` + defaults) |
 | `/api/simulation/sample/register` | POST | Register the active sample (params, volume, thickness) |
