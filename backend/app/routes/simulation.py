@@ -66,6 +66,12 @@ class SpecimenSettings(BaseModel):
 
 
 class DriftSettings(BaseModel):
+    # Physical interface (preferred): TEM-realistic drift is 0-10 nm/s;
+    # the cap leaves headroom for stress tests without allowing absurdity.
+    vx_nm_per_s: Optional[float] = Field(None, ge=0.0, le=50.0)
+    vy_nm_per_s: Optional[float] = Field(None, ge=0.0, le=50.0)
+    line_jitter_nm: Optional[float] = Field(None, ge=0.0, le=5.0)
+    # Legacy volume-pixel interface (kept for back-compat)
     vx_px_per_s: Optional[float] = None
     vy_px_per_s: Optional[float] = None
     line_jitter_px: Optional[float] = None

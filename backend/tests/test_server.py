@@ -7,6 +7,7 @@ and specimen-volume release across registrations.
 """
 
 import gc
+import time
 import weakref
 
 import numpy as np
@@ -620,3 +621,121 @@ class TestRegistryContract:
             schema = reg[name]["param_schema"]
             assert any(k == "seed" or k.endswith("_seed") for k in schema), (
                 f"stochastic sample {name} exposes no seed in param_schema")
+
+
+# ---------------------------------------------------------------------------
+# v2 realism package: physical drift units, idle-jump guard, real-dose damage
+# ---------------------------------------------------------------------------
+class TestPhysicalDrift:
+    def test_nm_per_s_converts_via_volume_scale(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        r = fresh_server.set_drift(vx_nm_per_s=2.0, vy_nm_per_s=1.0, enabled=True)
+        px_per_nm = fresh_server.sample_px_per_um / 1000.0
+        assert r["vx_px_per_s"] == pytest.approx(2.0 * px_per_nm)
+        assert r["vy_px_per_s"] == pytest.approx(1.0 * px_per_nm)
+
+    def test_result_echoes_physical_rates(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        r = fresh_server.set_drift(vx_nm_per_s=3.5, vy_nm_per_s=0.5)
+        assert r["vx_nm_per_s"] == pytest.approx(3.5)
+        assert r["vy_nm_per_s"] == pytest.approx(0.5)
+
+    def test_px_interface_still_works(self, fresh_server):
+        r = fresh_server.set_drift(vx_px_per_s=0.5, vy_px_per_s=0.25)
+        assert r["vx_px_per_s"] == pytest.approx(0.5)
+        assert r["vy_px_per_s"] == pytest.approx(0.25)
+
+    def test_idle_gap_is_capped_by_max_dt(self, fresh_server, monkeypatch):
+        """A long pause between acquires must not teleport the field: drift
+        advances by at most max_dt_s of wall-clock per frame."""
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_drift(vx_px_per_s=1.0, vy_px_per_s=0.0, enabled=True,
+                               reset_accum=True)
+        # Simulate a 60 s idle gap before the next acquire.
+        fresh_server._last_acquire_t = time.time() - 60.0
+        fresh_server.acquire_image("haadf")
+        accum = fresh_server.get_drift()["accum_x_px"]
+        max_dt = fresh_server.sim.drift["max_dt_s"]
+        assert accum <= 1.0 * max_dt + 1e-6, (
+            f"idle gap applied {accum:.2f} px of drift; cap is {max_dt}s * 1px/s")
+        assert accum > 0.0
+
+    def test_state_snapshot_reports_drift_and_dose(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_drift(vx_nm_per_s=1.0, enabled=True)
+        state = fresh_server.get_microscope_state()
+        assert state["drift"]["vx_nm_per_s"] == pytest.approx(1.0)
+        assert "max_accumulated_dose" in state["specimen"]
+        assert "damage_dose_threshold" in state["specimen"]
+
+
+class TestRealDose:
+    def _dose_after_one_frame(self, srv, fov_um, resolution_px):
+        srv.set_specimen(beam_damage_enabled=True)
+        srv._dose_map = None
+        srv._ensure_specimen_maps()
+        srv.device_settings("haadf", field_of_view_um=fov_um, size=resolution_px)
+        srv.acquire_image("haadf")
+        return float(srv._dose_map.max())
+
+    def test_dose_is_real_electrons_per_A2(self, fresh_server):
+        """dose = (I*t/e)/pixel_area with pixel_area=(FOV/res)^2."""
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_beam({"current_pA": 80.0}, relative=False)
+        fresh_server.device_settings("haadf", dwell_us=20.0)
+        dose = self._dose_after_one_frame(fresh_server, fov_um=1.0, resolution_px=512)
+        e_per_px = (80.0e-12 / 1.602e-19) * 20e-6
+        pix_A2 = ((1.0 * 1000.0 / 512) * 10.0) ** 2
+        assert dose == pytest.approx(e_per_px / pix_A2, rel=1e-3)
+
+    def test_higher_resolution_concentrates_dose(self, fresh_server):
+        """Same FOV, 512 -> 1024 px: 4x smaller pixel area, 4x the dose."""
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        d512 = self._dose_after_one_frame(fresh_server, fov_um=2.0, resolution_px=512)
+        d1024 = self._dose_after_one_frame(fresh_server, fov_um=2.0, resolution_px=1024)
+        assert d1024 == pytest.approx(4.0 * d512, rel=1e-3)
+
+    def test_smaller_fov_concentrates_dose(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        d_wide = self._dose_after_one_frame(fresh_server, fov_um=4.0, resolution_px=512)
+        d_narrow = self._dose_after_one_frame(fresh_server, fov_um=1.0, resolution_px=512)
+        assert d_narrow == pytest.approx(16.0 * d_wide, rel=1e-3)
+
+    def test_damage_is_gradual_log_progression(self, fresh_server):
+        """At 10x the critical dose, one frame loses exp(-rate) contrast --
+        gradual -- instead of the old linear collapse (exp(-9))."""
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_specimen(beam_damage_enabled=True,
+                                  damage_dose_threshold=100.0, damage_rate=1.0)
+        fresh_server._ensure_specimen_maps()
+        fresh_server._dose_map[:] = 1000.0   # 10x threshold everywhere
+        fresh_server.acquire_image("haadf")
+        factor = float(fresh_server._degradation_factor.mean())
+        assert factor == pytest.approx(np.exp(-1.0), rel=0.05), (
+            "log progression: 10x over-dose should cost exp(-rate), not collapse")
+
+    def test_default_threshold_is_moderately_robust(self, fresh_server):
+        assert fresh_server.get_specimen()["damage_dose_threshold"] == pytest.approx(3.0e4)
+
+
+class TestRetunedPresets:
+    @pytest.mark.parametrize("env,expected_nm", [
+        ("pristine", 0.0),
+        ("beam_sensitive", 0.4),
+        ("contaminating", 1.0),
+        ("thick_drifting", 5.0),
+        ("low_dose", 1.5),
+    ])
+    def test_preset_drift_is_realistic_nm_per_s(self, fresh_server, env, expected_nm):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_environment(env)
+        d = fresh_server._drift_state_with_nm()
+        assert d["vx_nm_per_s"] == pytest.approx(expected_nm, abs=1e-6)
+
+    def test_preset_thresholds_retuned(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_environment("beam_sensitive")
+        assert fresh_server.get_specimen()["damage_dose_threshold"] == pytest.approx(1.0e4)
+        assert fresh_server.get_specimen()["damage_rate"] == pytest.approx(0.8)
+        fresh_server.set_environment("low_dose")
+        assert fresh_server.get_specimen()["damage_dose_threshold"] == pytest.approx(5.0e3)
