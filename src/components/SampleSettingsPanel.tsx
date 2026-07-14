@@ -36,29 +36,35 @@ const ENVIRONMENTS = [
   {
     name: 'pristine',
     description: 'Ideal: no drift, no damage, high dose',
-    sets: 'drift off · damage off · contamination off · dwell 20 µs, DQE 0.9',
+    sets: 'drift ~0 nm/s (excellent) · damage off · contamination off · dwell 20 µs, DQE 0.9',
   },
   {
     name: 'beam_sensitive',
     description: 'Damage accumulates; autofocus can fail',
-    sets: 'drift 2,1 px/s · damage on (4e3 e⁻/Å², rate 0.7) · dwell 10 µs',
+    sets: 'drift ~0.5 nm/s (good) · damage on (critical dose 1e4 e⁻/Å², rate 0.8) · dwell 10 µs',
   },
   {
     name: 'contaminating',
     description: 'Carbon builds up where the beam dwells',
-    sets: 'drift 3,2 px/s · contamination on (rate 3) · dwell 15 µs',
+    sets: 'drift ~1.2 nm/s (moderate) · contamination on (rate 3) · dwell 15 µs',
   },
   {
     name: 'thick_drifting',
     description: 'Strong drift, noisy detector, 90 nm slab',
-    sets: 'drift 12,7 px/s (severe) · dwell 6 µs, DQE 0.7 · thickness → 90 nm',
+    sets: 'drift ~5.8 nm/s (poor) · dwell 6 µs, DQE 0.7 · thickness → 90 nm',
   },
   {
     name: 'low_dose',
     description: 'Dose-limited: very noisy imaging, 25 nm slab',
-    sets: 'drift 4,2 px/s · damage on (2.5e3, 0.8) · dwell 2 µs · thickness → 25 nm',
+    sets: 'drift ~1.7 nm/s · damage on (5e3, rate 1.0) · dwell 2 µs · thickness → 25 nm',
   },
 ];
+
+/** Format a dose value like 3.0e4 for the log slider read-out. */
+const formatDose = (v: number) => {
+  const exp = Math.floor(Math.log10(v));
+  return `${(v / 10 ** exp).toFixed(1)}e${exp}`;
+};
 
 /** Seed-like params are rendered as SeedField (randomize + visible value). */
 const SEED_LABELS: Record<string, string> = {
@@ -84,16 +90,19 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
   const [notice, setNotice] = useState<string | null>(null);
 
   // Custom environment knobs (apply-on-change; override the preset).
+  // Drift is in PHYSICAL nm/s (excellent <0.2 · good ~0.5 · moderate ~2 · poor ~5).
   const [driftEnabled, setDriftEnabled] = useState(false);
-  const [driftVx, setDriftVx] = useState(0);
-  const [driftVy, setDriftVy] = useState(0);
-  const [jitter, setJitter] = useState(0);
+  const [driftVx, setDriftVx] = useState(0.5);
+  const [driftVy, setDriftVy] = useState(0.5);
+  const [jitter, setJitter] = useState(0.05);
   const [damageEnabled, setDamageEnabled] = useState(false);
-  const [damageThreshold, setDamageThreshold] = useState(5000);
+  // Critical dose spans six decades (biological ~1-10 ... metals ~1e5-1e7),
+  // so the slider works in log10 space. Default 3e4 = moderately robust.
+  const [doseExp, setDoseExp] = useState(Math.log10(3e4));
   const [damageRate, setDamageRate] = useState(1.0);
   const [contamEnabled, setContamEnabled] = useState(false);
   const [contamRate, setContamRate] = useState(1.0);
-  const [dwellUs, setDwellUs] = useState(10);
+  const [dwellUs, setDwellUs] = useState(20);
 
   const connected = session?.connected ?? false;
   const registeredName = session?.sample?.name ?? null;
@@ -198,16 +207,19 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
     }
   };
 
-  // Custom environment: apply-on-change (overrides the preset).
+  // Custom environment: apply-on-change (overrides the preset). Drift goes
+  // through the physical nm/s interface; the server echoes the applied rate.
   const applyDrift = async (patch: Partial<{ enabled: boolean; vx: number; vy: number; jitter: number }>) => {
     try {
-      await setDrift({
+      const r = await setDrift({
         enabled: patch.enabled ?? driftEnabled,
-        vx_px_per_s: patch.vx ?? driftVx,
-        vy_px_per_s: patch.vy ?? driftVy,
-        line_jitter_px: patch.jitter ?? jitter,
+        vx_nm_per_s: patch.vx ?? driftVx,
+        vy_nm_per_s: patch.vy ?? driftVy,
+        line_jitter_nm: patch.jitter ?? jitter,
       });
-      setNotice('Custom drift applied');
+      setNotice(
+        `Drift set: ${r.drift.vx_nm_per_s.toFixed(2)}, ${r.drift.vy_nm_per_s.toFixed(2)} nm/s`,
+      );
     } catch (e) {
       reportError(e, 'Failed to set drift');
     }
@@ -217,7 +229,7 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
     try {
       await setSpecimen({
         beam_damage_enabled: (patch.beam_damage_enabled as boolean) ?? damageEnabled,
-        damage_dose_threshold: (patch.damage_dose_threshold as number) ?? damageThreshold,
+        damage_dose_threshold: (patch.damage_dose_threshold as number) ?? 10 ** doseExp,
         damage_rate: (patch.damage_rate as number) ?? damageRate,
         contamination_enabled: (patch.contamination_enabled as boolean) ?? contamEnabled,
         contamination_rate: (patch.contamination_rate as number) ?? contamRate,
@@ -463,19 +475,19 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
                     Mechanical drift
                   </label>
                   <ScaledSlider
-                    label="Drift vx" value={driftVx} min={0} max={15} step={0.5} unit="px/s"
-                    scaleLabels={['none', 'mild', 'moderate', 'severe']}
+                    label="Drift vx" value={driftVx} min={0} max={10} step={0.1} unit="nm/s"
+                    scaleLabels={['excellent', 'good', 'moderate', 'poor']}
                     onCommit={(v) => { setDriftVx(v); applyDrift({ vx: v }); }}
                     disabled={!connected || busy || !driftEnabled}
                   />
                   <ScaledSlider
-                    label="Drift vy" value={driftVy} min={0} max={15} step={0.5} unit="px/s"
-                    scaleLabels={['none', 'mild', 'moderate', 'severe']}
+                    label="Drift vy" value={driftVy} min={0} max={10} step={0.1} unit="nm/s"
+                    scaleLabels={['excellent', 'good', 'moderate', 'poor']}
                     onCommit={(v) => { setDriftVy(v); applyDrift({ vy: v }); }}
                     disabled={!connected || busy || !driftEnabled}
                   />
                   <ScaledSlider
-                    label="Line jitter" value={jitter} min={0} max={2} step={0.1} unit="px"
+                    label="Line jitter" value={jitter} min={0} max={0.5} step={0.01} unit="nm"
                     onCommit={(v) => { setJitter(v); applyDrift({ jitter: v }); }}
                     disabled={!connected || busy || !driftEnabled}
                   />
@@ -500,12 +512,27 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
                     />
                     Beam damage
                   </label>
-                  <ScaledSlider
-                    label="Dose threshold" value={damageThreshold} min={1000} max={10000} step={100} unit="e⁻/Å²"
-                    scaleLabels={['fragile', '', 'robust']}
-                    onCommit={(v) => { setDamageThreshold(v); applySpecimen({ damage_dose_threshold: v }); }}
-                    disabled={!connected || busy || !damageEnabled}
-                  />
+                  {/* Critical dose spans six decades -> log slider (spec A5) */}
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-400">Critical dose</span>
+                      <span className="text-white font-mono bg-slate-700 px-2 py-0.5 rounded">
+                        {formatDose(10 ** doseExp)} e⁻/Å²
+                      </span>
+                    </div>
+                    <input
+                      type="range" min={2} max={6} step={0.05} value={doseExp}
+                      onChange={(e) => setDoseExp(Number(e.target.value))}
+                      onMouseUp={() => applySpecimen({ damage_dose_threshold: 10 ** doseExp })}
+                      onTouchEnd={() => applySpecimen({ damage_dose_threshold: 10 ** doseExp })}
+                      disabled={!connected || busy || !damageEnabled}
+                      aria-label="Critical dose"
+                      className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-500 disabled:opacity-50"
+                    />
+                    <div className="flex justify-between text-[10px] text-slate-600">
+                      <span>zeolite/MOF</span><span>oxides</span><span>metals</span>
+                    </div>
+                  </div>
                   <ScaledSlider
                     label="Damage rate" value={damageRate} min={0} max={2} step={0.05}
                     onCommit={(v) => { setDamageRate(v); applySpecimen({ damage_rate: v }); }}
@@ -537,7 +564,7 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
                 <div className="space-y-2 bg-slate-800/50 rounded-lg p-3">
                   <div className="text-xs text-slate-300 font-medium">Detector dose</div>
                   <ScaledSlider
-                    label="Dwell time (lower = noisier)" value={dwellUs} min={1} max={50} step={1} unit="µs"
+                    label="Dwell time (lower = noisier)" value={dwellUs} min={1} max={100} step={1} unit="µs"
                     scaleLabels={['noisy', '', 'clean']}
                     onCommit={(v) => { setDwellUs(v); applyDwell(v); }}
                     disabled={!connected || busy}

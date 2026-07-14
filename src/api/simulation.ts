@@ -188,11 +188,16 @@ export function getDrift(): Promise<DriftState> {
 }
 
 export function setDrift(settings: {
+  /** Physical interface (preferred): TEM-realistic drift is 0–10 nm/s. */
+  vx_nm_per_s?: number;
+  vy_nm_per_s?: number;
+  line_jitter_nm?: number;
+  /** Legacy volume-pixel interface. */
   vx_px_per_s?: number;
   vy_px_per_s?: number;
   line_jitter_px?: number;
   enabled?: boolean;
   reset_accum?: boolean;
-}): Promise<{ success: boolean; drift: DriftState }> {
+}): Promise<{ success: boolean; drift: DriftState & { vx_nm_per_s: number; vy_nm_per_s: number } }> {
   return apiPost('/simulation/drift', settings);
 }
