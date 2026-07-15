@@ -18,6 +18,24 @@ Install these first if you don't have them:
 > **Note your Python version** — it matters for one optional dependency
 > (abTEM) in step 4.
 
+### Python too old? (macOS ships 3.9.6)
+
+Don't try to update the system Python — install a newer one alongside it:
+
+- **macOS with Homebrew:** `brew install python@3.12`
+- **macOS/Windows without Homebrew:** install 3.11 or 3.12 from
+  https://www.python.org/downloads/ (on Windows, tick *"Add python.exe to
+  PATH"*).
+
+Then in step 3 create the venv with the new interpreter **explicitly**
+(plain `python3` may still point at the old one):
+
+```bash
+python3.12 -m venv venv      # Windows: py -3.12 -m venv venv
+```
+
+Once the venv is created, activating it always gives you the right Python.
+
 ---
 
 ## 2. Clone the repository
