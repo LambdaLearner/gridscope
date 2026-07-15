@@ -46,6 +46,10 @@ The system keeps two surfaces strictly apart, so what you test here deploys ther
 
 ## Quick Start
 
+> **First time on a new machine?** Follow the step-by-step guide in
+> **[SETUP.md](SETUP.md)** — it covers prerequisites, the abTEM version pin,
+> and troubleshooting.
+
 ### Prerequisites
 
 - Node.js ≥ 18.x
