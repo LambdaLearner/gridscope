@@ -30,11 +30,31 @@ CONTROL_CLIENT_CODE = _load_control_client_code()
 
 # Helper embedded in every script: streams acquired frames to the GridScope UI
 # via the stdout marker protocol. Harmless when run outside GridScope (it just
-# prints one long line).
+# prints one long line). It attaches the AUTHORITATIVE stage position, read
+# back from the instrument at report time, so every frame the UI shows carries
+# real coordinates -- scripts (and the LLM) don't need to pass them manually.
+# Uses only the portable client API, so it works against a real instrument.
 REPORT_IMAGE_HELPER = f'''
-def report_image(img, **meta):
-    """Stream an acquired frame to the GridScope UI. Call after every acquire."""
+def report_image(img, mic=None, **meta):
+    """Stream an acquired frame to the GridScope UI. Call after every acquire.
+
+    The frame's stage position (x/y/z in um, tilts in degrees) is read back
+    from the instrument and attached automatically. Pass `mic` explicitly when
+    the client is not the module-level `mic`. Explicit meta keys win over the
+    readback.
+    """
     import base64 as _b64, json as _json
+    client = mic if mic is not None else globals().get("mic")
+    if client is not None:
+        try:
+            _p = (list(client.get_stage()) + [0.0] * 5)[:5]
+            _stage = {{"x_um": _p[0] * 1e6, "y_um": _p[1] * 1e6,
+                       "z_um": _p[2] * 1e6, "a_deg": _p[3], "b_deg": _p[4]}}
+            for _k, _v in _stage.items():
+                meta.setdefault(_k, _v)
+            meta.setdefault("stage", _stage)
+        except Exception:
+            pass  # position is best-effort; never fail the report
     payload = {{
         "raw_b64": _b64.b64encode(img.tobytes(order="C")).decode("ascii"),
         "shape": list(img.shape),
@@ -143,7 +163,7 @@ def run_experiment():
 
         img = mic.acquire_image("haadf")
         acquired += 1
-        report_image(img, tile=tile_index, x_um=x_um, y_um=y_um)
+        report_image(img, mic, tile=tile_index)
         print(f"  Acquired {{img.shape}} {{img.dtype}}")
 
         if CONFIG["dwell_time_s"] > 0:
@@ -266,7 +286,8 @@ Rules:
 - Stage positions in METRES (µm × 1e-6); tilt in DEGREES.
 - Handle stage-limit rejections (RuntimeError from set_stage) and autofocus
   non-convergence (result["converged"] is False).
-- Call report_image(img, ...) after every acquire_image.
+- Call report_image(img, ...) after every acquire_image. The frame's stage
+  position is read back and attached automatically — do not pass x_um/y_um.
 - Always use "{DEFAULT_DETECTOR}" as the detector.
 
 Respond with JSON:

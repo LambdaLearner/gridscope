@@ -70,6 +70,7 @@ export interface DriftStateSnapshot {
   vy_px_per_s: number;
   vx_nm_per_s: number;
   vy_nm_per_s: number;
+  line_jitter_nm: number;
   accum_x_px: number;
   accum_y_px: number;
   line_jitter_px: number;
@@ -81,6 +82,8 @@ export interface SpecimenSnapshot {
   beam_damage_enabled: number;
   contamination_enabled: number;
   damage_dose_threshold: number;
+  damage_rate: number;
+  contamination_rate: number;
   max_accumulated_dose: number;
   max_contamination: number;
 }
@@ -258,7 +261,8 @@ export function getResolution(device = 'haadf'): Promise<ResolutionInfo> {
   return apiGet(`/microscope/resolution?device=${device}`);
 }
 
-/** resolution_px must be one of 512/1024/2048; 2048 frames can take ~30 s. */
+/** resolution_px must be in the server's `allowed` list (1024/2048/4096).
+ *  Cost scales with pixel count; 4096 with non-zero tilt takes minutes. */
 export function setResolution(
   resolution_px: number,
   device = 'haadf',
@@ -266,11 +270,14 @@ export function setResolution(
   return apiPost('/microscope/resolution', { resolution_px, device });
 }
 
-/** Single-spot EELS spectrum (structured dummy on the twin). */
+/** Single-spot EELS spectrum (structured dummy on the twin). Pass cx_um/cy_um
+ *  to park the probe at the stage position; omitted = sample centre (0, 0). */
 export function acquireSpectrum(options: {
   ev_min?: number;
   ev_max?: number;
   n_channels?: number;
+  cx_um?: number;
+  cy_um?: number;
 } = {}): Promise<SpectrumResult> {
   return apiPost('/microscope/spectrum', options);
 }

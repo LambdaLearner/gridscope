@@ -117,3 +117,81 @@ class TestEnsureSelfContained:
     def test_idempotent(self):
         once = ensure_self_contained("x = 1")
         assert ensure_self_contained(once) == once
+
+
+class TestReportImageStageInjection:
+    """The helper reads the stage back from the client and attaches the
+    authoritative position to every frame (v3 fix for 'position shown is not
+    correct while running LLM code')."""
+
+    class FakeMic:
+        def get_stage(self):
+            # metres / degrees, as the real client returns
+            return [2.5e-6, -1.25e-6, 0.5e-6, 3.0, -7.5]
+
+    def _run_helper(self, capsys, script_tail):
+        import json as _json
+
+        from app.constants import IMAGE_MARKER
+
+        ns = {}
+        exec(REPORT_IMAGE_HELPER, ns)
+        ns["FakeMic"] = self.FakeMic
+        exec(script_tail, ns)
+        out = capsys.readouterr().out
+        line = next(l for l in out.splitlines() if l.startswith(IMAGE_MARKER))
+        return _json.loads(line[len(IMAGE_MARKER):])
+
+    def test_stage_attached_from_explicit_mic(self, capsys):
+        import numpy as np
+        payload = self._run_helper(capsys, (
+            "import numpy as np\n"
+            "report_image(np.zeros((4, 4), dtype='uint16'), FakeMic(), label='t')\n"
+        ))
+        meta = payload["meta"]
+        assert meta["x_um"] == 2.5
+        assert meta["y_um"] == -1.25
+        assert meta["z_um"] == 0.5
+        assert meta["a_deg"] == 3.0
+        assert meta["b_deg"] == -7.5
+        assert meta["stage"]["x_um"] == 2.5
+        assert meta["label"] == "t"
+
+    def test_stage_attached_from_module_level_mic(self, capsys):
+        payload = self._run_helper(capsys, (
+            "import numpy as np\n"
+            "mic = FakeMic()\n"
+            "report_image(np.zeros((4, 4), dtype='uint16'))\n"
+        ))
+        assert payload["meta"]["x_um"] == 2.5
+
+    def test_explicit_meta_wins_over_readback(self, capsys):
+        payload = self._run_helper(capsys, (
+            "import numpy as np\n"
+            "report_image(np.zeros((4, 4), dtype='uint16'), FakeMic(), x_um=99.0)\n"
+        ))
+        assert payload["meta"]["x_um"] == 99.0     # script-supplied wins
+        assert payload["meta"]["y_um"] == -1.25    # rest still attached
+
+    def test_no_mic_in_scope_still_reports(self, capsys):
+        payload = self._run_helper(capsys, (
+            "import numpy as np\n"
+            "report_image(np.zeros((4, 4), dtype='uint16'), label='bare')\n"
+        ))
+        assert payload["meta"] == {"label": "bare"}
+
+    def test_broken_get_stage_never_fails_the_report(self, capsys):
+        payload = self._run_helper(capsys, (
+            "import numpy as np\n"
+            "class Broken:\n"
+            "    def get_stage(self):\n"
+            "        raise RuntimeError('link down')\n"
+            "report_image(np.zeros((4, 4), dtype='uint16'), Broken(), label='x')\n"
+        ))
+        assert payload["meta"] == {"label": "x"}
+
+    def test_template_passes_mic_to_report_image(self):
+        gen = MicroscopyCodeGenerator(api_key=None)
+        code = gen.generate_from_template(
+            CodeGenerationRequest(objective="grid scan"))
+        assert "report_image(img, mic" in code

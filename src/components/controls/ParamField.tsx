@@ -11,10 +11,11 @@ interface ParamFieldProps {
 /**
  * Generic schema-driven control for one sample parameter (spec §1.2: do NOT
  * hard-code parameter controls). Renders by schema type:
- *   int   -> bounded integer spinbox
- *   float -> bounded float spinbox (step ~ (max-min)/100)
- *   bool  -> checkbox
- *   str   -> text field
+ *   int            -> bounded integer spinbox
+ *   float          -> bounded float spinbox (step ~ (max-min)/100)
+ *   bool           -> checkbox
+ *   str + choices  -> dropdown (v3 schema addition: zone_axis, orientation_mode)
+ *   str            -> text field
  */
 export function ParamField({ name, schema, value, onChange, disabled }: ParamFieldProps) {
   const label = name.replace(/_/g, ' ');
@@ -36,6 +37,25 @@ export function ParamField({ name, schema, value, onChange, disabled }: ParamFie
         />
         {label}
       </label>
+    );
+  }
+
+  if (schema.type === 'str' && schema.choices && schema.choices.length > 0) {
+    return (
+      <div className="space-y-0.5">
+        <label className="text-xs text-slate-400">{label}</label>
+        <select
+          value={String(value ?? schema.choices[0])}
+          onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
+          aria-label={name}
+          className="w-full bg-slate-700 text-white text-xs rounded px-2 py-1.5 border border-slate-600 focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
+        >
+          {schema.choices.map((c) => (
+            <option key={c} value={c}>{c}</option>
+          ))}
+        </select>
+      </div>
     );
   }
 

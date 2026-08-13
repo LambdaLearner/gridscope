@@ -74,11 +74,13 @@ mic.set_mode(mode: str) -> Dict   # "IMG", "DIFF", or "EELS"
 
 # --- Acquisition resolution windows (discrete, like a real scan generator) ---
 mic.get_resolution(device="haadf") -> Dict
-    # {"resolution_px": 512, "allowed": [512, 1024, 2048]}
+    # {"resolution_px": 1024, "allowed": [1024, 2048, 4096]}
 mic.set_resolution(resolution_px: int, device="haadf") -> Dict
-    # resolution_px must be one of 512/1024/2048; anything else raises.
-    # Higher resolution = finer detail at the same FOV but a slower frame
-    # (2048 px can take ~30 s).
+    # resolution_px must be in the "allowed" list (read it at runtime; the
+    # current set is 1024/2048/4096) -- anything else raises.
+    # Higher resolution = finer detail at the same FOV but a slower frame:
+    # cost scales with pixel COUNT (4x per step). Untilted 4096 is ~seconds;
+    # 4096 with non-zero tilt takes MINUTES -- avoid unless deliberate.
 
 # --- Diffraction projection ---
 mic.get_diffraction_settings() -> Dict
@@ -121,7 +123,9 @@ mic.close()
   NEVER select samples, environments, or simulation settings — those concepts
   do not exist on a real instrument.
 - After each acquisition call report_image(img, ...) (helper included in the
-  script template) so the frame streams back to the GridScope UI.
+  script template) so the frame streams back to the GridScope UI. The helper
+  reads the stage back and attaches the frame's true position automatically —
+  do not pass x_um/y_um yourself.
 """
 
 # Workflow template snippets the LLM can reference for common tasks.

@@ -22,6 +22,12 @@ import {
 } from '../api/simulation';
 import { setDetectorSettings, type SessionSnapshot } from '../api/digitalTwin';
 import { ApiError } from '../api/client';
+import {
+  CONTAMINATION_MAX_RATE,
+  DAMAGE_MAX_RATE,
+  DRIFT_MAX_JITTER_NM,
+  DRIFT_MAX_NM_PER_S,
+} from '../api/limits';
 import { ParamField } from './controls/ParamField';
 import { SeedField } from './controls/SeedField';
 import { ScaledSlider } from './controls/ScaledSlider';
@@ -109,6 +115,33 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
   const currentEnv = session?.state?.environment;
   const thickness = session?.state?.thickness;
   const busy = isRegistering || runActive;
+
+  // Hydrate the custom sliders from the server whenever the environment
+  // changes (presets set drift/specimen server-side; without this the
+  // sliders keep showing stale local values). Also hydrates on first poll.
+  const stateDrift = session?.state?.drift;
+  const stateSpecimen = session?.state?.specimen;
+  useEffect(() => {
+    if (!stateDrift || !stateSpecimen) return;
+    setDriftEnabled(stateDrift.enabled >= 0.5);
+    setDriftVx(+stateDrift.vx_nm_per_s.toFixed(2));
+    setDriftVy(+stateDrift.vy_nm_per_s.toFixed(2));
+    if (stateDrift.line_jitter_nm !== undefined) {
+      setJitter(+stateDrift.line_jitter_nm.toFixed(2));
+    }
+    setDamageEnabled(stateSpecimen.beam_damage_enabled >= 0.5);
+    setDoseExp(Math.log10(Math.max(1, stateSpecimen.damage_dose_threshold)));
+    if (stateSpecimen.damage_rate !== undefined) {
+      setDamageRate(stateSpecimen.damage_rate);
+    }
+    setContamEnabled(stateSpecimen.contamination_enabled >= 0.5);
+    if (stateSpecimen.contamination_rate !== undefined) {
+      setContamRate(stateSpecimen.contamination_rate);
+    }
+    // Re-run only when the environment changes or the connection appears —
+    // hydrating on every 2 s poll would fight in-progress slider edits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentEnv, connected]);
 
   const fetchSamples = useCallback(async () => {
     setIsLoadingList(true);
@@ -474,23 +507,31 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
                     />
                     Mechanical drift
                   </label>
+                  {/* Visibility depends on FOV: 1 px ≈ FOV/1024, so at a 20 µm
+                      field even 10 nm/s moves <1 px per frame. Watch drift in
+                      Live mode at ≤1 µm FOV, or raise the rate. */}
                   <ScaledSlider
-                    label="Drift vx" value={driftVx} min={0} max={10} step={0.1} unit="nm/s"
+                    label="Drift vx" value={driftVx} min={0} max={DRIFT_MAX_NM_PER_S} step={0.1} unit="nm/s"
                     scaleLabels={['excellent', 'good', 'moderate', 'poor']}
                     onCommit={(v) => { setDriftVx(v); applyDrift({ vx: v }); }}
                     disabled={!connected || busy || !driftEnabled}
                   />
                   <ScaledSlider
-                    label="Drift vy" value={driftVy} min={0} max={10} step={0.1} unit="nm/s"
+                    label="Drift vy" value={driftVy} min={0} max={DRIFT_MAX_NM_PER_S} step={0.1} unit="nm/s"
                     scaleLabels={['excellent', 'good', 'moderate', 'poor']}
                     onCommit={(v) => { setDriftVy(v); applyDrift({ vy: v }); }}
                     disabled={!connected || busy || !driftEnabled}
                   />
                   <ScaledSlider
-                    label="Line jitter" value={jitter} min={0} max={0.5} step={0.01} unit="nm"
+                    label="Line jitter" value={jitter} min={0} max={DRIFT_MAX_JITTER_NM} step={0.05} unit="nm"
                     onCommit={(v) => { setJitter(v); applyDrift({ jitter: v }); }}
                     disabled={!connected || busy || !driftEnabled}
                   />
+                  <p className="text-[10px] text-slate-500 leading-snug">
+                    Drift shows as frame-to-frame motion: use Live mode at a small
+                    FOV (≤1 µm) — at wide fields one pixel spans tens of nm, so
+                    even fast drift looks static.
+                  </p>
                   <button
                     onClick={() => setDrift({ reset_accum: true }).then(() => setNotice('Drift accumulation reset (view re-centred)')).catch((e) => reportError(e, 'Failed to reset drift'))}
                     disabled={!connected || busy}
@@ -534,7 +575,7 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
                     </div>
                   </div>
                   <ScaledSlider
-                    label="Damage rate" value={damageRate} min={0} max={2} step={0.05}
+                    label="Damage rate" value={damageRate} min={0} max={DAMAGE_MAX_RATE} step={0.05}
                     onCommit={(v) => { setDamageRate(v); applySpecimen({ damage_rate: v }); }}
                     disabled={!connected || busy || !damageEnabled}
                   />
@@ -553,11 +594,16 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
                     Contamination
                   </label>
                   <ScaledSlider
-                    label="Contamination rate" value={contamRate} min={0} max={5} step={0.1}
+                    label="Contamination rate" value={contamRate} min={0} max={CONTAMINATION_MAX_RATE} step={0.1}
                     scaleLabels={['none', 'mild', 'heavy']}
                     onCommit={(v) => { setContamRate(v); applySpecimen({ contamination_rate: v }); }}
                     disabled={!connected || busy || !contamEnabled}
                   />
+                  <p className="text-[10px] text-slate-500 leading-snug">
+                    Contamination builds where the beam dwells: it needs repeated
+                    frames over the same spot (Live mode at high magnification)
+                    and grows fastest with high current and long dwell.
+                  </p>
                 </div>
 
                 {/* Detector dose */}

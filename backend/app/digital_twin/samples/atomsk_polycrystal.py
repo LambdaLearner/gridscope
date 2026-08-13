@@ -19,19 +19,52 @@ Atomsk example to produce a usable file:
                                               ^      ^
                                               also writes poly.xyz, poly.cfg
 
-Default file path: 'sample_data/polycrystal.xyz' (override with file_path param).
+Default file path: 'sample_data/polycrystal.xyz'. Relative paths are resolved
+against the current working directory first, then against the backend root
+(the directory holding `app/`), where an example file ships at
+`sample_data/polycrystal.xyz`.
 
-A note on units:
-  Atomsk works in Angstroms. The voxel grid is whatever physical scale you set
-  via `sample_fov_um`. The `scale_factor` parameter controls how atomistic
-  coordinates map to voxels; the default tries to fit the whole structure
-  into the volume. Use `auto_fit=True` to ignore scale_factor and just stretch
-  the bounding box to fill the volume.
+A note on units and scaling:
+  Atomsk works in Angstroms, and atoms keep their TRUE physical scale. With
+  `auto_fit=True` (the default) the sample instead shrinks its generated WORLD
+  (`generation_range_um`) so the structure spans ~70% of the volume laterally --
+  the atomic spacings stay physically honest and the structure fills the field.
+  The z axis is scaled independently so the slab fits the volume depth (the
+  raster volume is a projection proxy; diffraction and column imaging use the
+  real 3-D Angstrom positions kept in `_atoms_A`). With `auto_fit=False`,
+  `scale_factor` (voxels per Angstrom) maps coordinates into the default
+  20 um world unchanged.
 """
 import os
+from pathlib import Path
 import numpy as np
 from .base import Sample, SampleMetadata
 from . import register
+
+# Backend root (the directory containing `app/`), used to resolve relative
+# file paths independently of where the twin process was launched from.
+_BACKEND_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _resolve_structure_path(path_str):
+    """Resolve `file_path` to an existing file, or raise FileNotFoundError.
+
+    Absolute paths are used as-is. Relative paths are tried against the
+    process cwd first (backward compatible), then against the backend root,
+    so the shipped example works no matter where the server was started.
+    """
+    p = Path(path_str).expanduser()
+    candidates = [p] if p.is_absolute() else [Path.cwd() / p, _BACKEND_ROOT / p]
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
+    tried = " or ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        f"Atomsk structure file not found: {path_str!r} (looked in {tried}). "
+        "Set `file_path` to an absolute path, or place the file under "
+        f"{_BACKEND_ROOT / 'sample_data'}. An example polycrystal ships at "
+        "'sample_data/polycrystal.xyz'."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +174,11 @@ class AtomskPolycrystal(Sample):
         description=("Loads an atomistic structure file (xyz, lmp, cfg, cif, xsf) "
                      "and rasterizes it. Designed for Atomsk --polycrystal output."),
         default_params={
-            # Path to the structure file. Relative paths are resolved against cwd.
+            # Path to the structure file. Relative paths resolve against the
+            # cwd, then the backend root (where an example file ships).
             "file_path": "sample_data/polycrystal.xyz",
-            # If True, auto-scale the structure's bounding box to fill the volume
-            # in XY. Z gets centered with no stretching beyond what fits.
+            # If True, shrink the generated world so the structure spans ~70%
+            # of the volume laterally at TRUE atomic scale (see module doc).
             "auto_fit": True,
             # Manual scaling: voxels per Angstrom (only used if auto_fit=False).
             "scale_factor": 0.1,
@@ -170,19 +204,15 @@ class AtomskPolycrystal(Sample):
     )
 
     # Polycrystals are atomistic — much smaller real extent than µm samples.
-    # Override the physical mapping so a single Atomsk structure spans the
-    # active FOV nicely. Users can still rescale via load_sample(...) params.
-    tilt_strength_px_per_slice = 0.35
+    # With auto_fit=True, generate_volume() shrinks the instance's
+    # generation_range_um to match the loaded structure, so the world the
+    # server maps the stage/FOV onto is the structure's own physical size.
+    # The fraction of the volume the structure spans laterally:
+    AUTO_FIT_SPAN = 0.70
 
     def generate_volume(self, D, H, W):
         p = self.params
-        path = str(p["file_path"])
-        if not os.path.isfile(path):
-            raise FileNotFoundError(
-                f"Atomsk file not found: {path!r}. "
-                "Upload it to the Colab session or set `file_path` to its actual location. "
-                "See the notebook's 'How to provide a polycrystal file' section."
-            )
+        path = _resolve_structure_path(str(p["file_path"]))
 
         positions, symbols = _read_structure_file(path)
         n_total = len(positions)
@@ -211,22 +241,28 @@ class AtomskPolycrystal(Sample):
         extent_A = np.maximum(pmax - pmin, 1e-6)
 
         if bool(p["auto_fit"]):
-            # TRUE-SCALE mapping (not stretch-to-fill). 1 voxel = generation range
-            # per W pixels, so atoms sit at their real physical size and the loaded
-            # structure occupies the correct fraction of the field -- consistent
-            # with get_atoms_in_region (which uses true Angstrom positions). A tiny
-            # cell will therefore look small (as it physically is); scale it up in
-            # Atomsk if you want it to fill more of the field.
-            #   voxels per Angstrom = (W / generation_range_um) / 1e4
-            vox_per_A = (W / float(self.generation_range_um)) / 1.0e4
-            scales = np.array([vox_per_A, vox_per_A, vox_per_A], dtype=np.float32)
-            # if the structure is far larger than the volume, fall back to a fit so
-            # it is at least visible (with a warning-friendly comment)
-            if (extent_A[0] * vox_per_A > W) or (extent_A[1] * vox_per_A > H):
-                margin = 0.92
-                sxy = min((W * margin) / extent_A[0], (H * margin) / extent_A[1])
-                sz = min(sxy, (D * margin) / max(extent_A[2], 1e-6))
-                scales = np.array([sxy, sxy, sz], dtype=np.float32)
+            # TRUE-SCALE atoms, structure-sized WORLD. Instead of stretching the
+            # atom coordinates (which would falsify interatomic spacings and the
+            # diffraction they produce), shrink the generated world so the
+            # structure spans AUTO_FIT_SPAN of the volume laterally. The server
+            # reads generation_range_um AFTER generate_volume(), so setting the
+            # instance value here re-scales the whole stage/FOV mapping to this
+            # sample's real physical size.
+            extent_xy_A = float(max(extent_A[0], extent_A[1]))
+            world_um = (extent_xy_A / self.AUTO_FIT_SPAN) / 1.0e4
+            self.generation_range_um = world_um
+            self.sample_fov_um = world_um
+            # Physical slab thickness follows the structure's real depth (the
+            # server derives working thickness and the diffraction relrod from
+            # this), floored at 1 nm for planar structures.
+            self.thickness_nm = max(1.0, float(extent_A[2]) / 10.0)
+            #   voxels per Angstrom = (W / world_um) / 1e4
+            vox_per_A = (W / world_um) / 1.0e4
+            # z is scaled independently to fit the volume depth: the raster
+            # volume is a projection proxy, while diffraction and column
+            # imaging use the real 3-D positions kept in _atoms_A below.
+            sz = min(vox_per_A, (D * 0.92) / max(float(extent_A[2]), 1e-6))
+            scales = np.array([vox_per_A, vox_per_A, sz], dtype=np.float32)
         else:
             s = float(p["scale_factor"])
             scales = np.array([s, s, s], dtype=np.float32)

@@ -99,7 +99,7 @@ class TestWorkflowTemplates:
             assert f"mic.{method}(" in MICROSCOPE_API_SPEC, (
                 f"{method} missing from the documented control surface"
             )
-        assert "512" in MICROSCOPE_API_SPEC and "2048" in MICROSCOPE_API_SPEC
+        assert "1024" in MICROSCOPE_API_SPEC and "4096" in MICROSCOPE_API_SPEC
         assert "EELS" in MICROSCOPE_API_SPEC
 
     def test_acquiring_templates_report_images(self):

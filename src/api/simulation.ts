@@ -15,6 +15,9 @@ export interface ParamSchemaEntry {
   type: 'int' | 'float' | 'bool' | 'str';
   min?: number;
   max?: number;
+  /** For str params with a fixed value set (v3: e.g. zone_axis,
+   *  orientation_mode) — render a dropdown, not a text field. */
+  choices?: string[];
 }
 
 export interface SampleInfo {

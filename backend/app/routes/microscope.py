@@ -10,12 +10,13 @@ FastAPI runs sync handlers in its threadpool, keeping the event loop free.
 """
 
 import threading
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
 
+from ..digital_twin.limits import ALLOWED_RESOLUTIONS
 from ..services import twin_session as ts
 from ..services.capture import store as capture_store
 
@@ -89,9 +90,17 @@ class DiffractionSettings(BaseModel):
 
 class SetResolutionRequest(BaseModel):
     # The twin (like a real scan generator) offers a fixed set of windows;
-    # validating here gives a 422 with the legal values before any RPC.
-    resolution_px: Literal[512, 1024, 2048]
+    # validating here gives a 422 with the legal values before any RPC. The
+    # set is imported from digital_twin.limits so route and twin cannot drift.
+    resolution_px: int
     device: str = "haadf"
+
+    @model_validator(mode="after")
+    def _resolution_allowed(self):
+        if self.resolution_px not in ALLOWED_RESOLUTIONS:
+            raise ValueError(
+                f"resolution_px must be one of {list(ALLOWED_RESOLUTIONS)}")
+        return self
 
 
 class AcquireSpectrumRequest(BaseModel):

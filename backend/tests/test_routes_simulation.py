@@ -268,7 +268,7 @@ class TestEndToEnd:
         # Acquire now works and returns a PNG payload
         r = e2e_client.post("/api/microscope/acquire", json={"device": "haadf"})
         assert r.status_code == 200
-        assert r.json()["image"]["width"] == 512
+        assert r.json()["image"]["width"] == 1024
 
     def test_real_limit_rejection_maps_to_400(self, e2e_client):
         r = e2e_client.post("/api/microscope/stage",
@@ -285,10 +285,18 @@ class TestEndToEnd:
         assert r.status_code == 404
 
     def test_file_backed_sample_maps_to_400(self, e2e_client):
+        # The DEFAULT path now resolves to the shipped example, so use an
+        # explicit bogus path to exercise the clear-failure mapping.
         r = e2e_client.post("/api/simulation/sample/register",
-                            json={"name": "atomsk_polycrystal"})
+                            json={"name": "atomsk_polycrystal",
+                                  "params": {"file_path": "no/such/file.xyz"}})
         assert r.status_code == 400
         assert "file not found" in r.json()["detail"].lower()
+
+    def test_file_backed_sample_default_registers(self, e2e_client):
+        r = e2e_client.post("/api/simulation/sample/register",
+                            json={"name": "atomsk_polycrystal"})
+        assert r.status_code == 200
 
     def test_thickness_resolution_and_spectrum_flow(self, e2e_client):
         # Register with an explicit working thickness + seed
@@ -310,14 +318,14 @@ class TestEndToEnd:
 
         # Resolution windows
         r = e2e_client.get("/api/microscope/resolution")
-        assert r.json()["allowed"] == [512, 1024, 2048]
+        assert r.json()["allowed"] == [1024, 2048, 4096]
         r = e2e_client.post("/api/microscope/resolution",
-                            json={"resolution_px": 1024})
+                            json={"resolution_px": 2048})
         assert r.status_code == 200
         r = e2e_client.post("/api/microscope/resolution",
                             json={"resolution_px": 768})
         assert r.status_code == 422  # not a legal window
-        e2e_client.post("/api/microscope/resolution", json={"resolution_px": 512})
+        e2e_client.post("/api/microscope/resolution", json={"resolution_px": 1024})
 
         # EELS spectrum shows the Fe-L edge for the Fe crystal
         r = e2e_client.post("/api/microscope/spectrum",
@@ -327,3 +335,59 @@ class TestEndToEnd:
         body = r.json()
         assert len(body["energy_ev"]) == 256
         assert "Fe-L" in [e["label"] for e in body["edges"]]
+
+
+class TestDriftSpecimenBounds:
+    """Drift/specimen limits are enforced at the HTTP boundary (7A): scripts
+    hit this surface too, so out-of-range values must 422, not render garbage.
+    Bounds come from app.digital_twin.limits — one Python source of truth."""
+
+    def test_drift_within_bounds_ok(self, client, harness):
+        r = client.post("/api/simulation/drift",
+                        json={"enabled": True, "vx_nm_per_s": 50.0,
+                              "vy_nm_per_s": 0.0, "line_jitter_nm": 5.0})
+        assert r.status_code == 200
+
+    @pytest.mark.parametrize("payload", [
+        {"vx_nm_per_s": 50.1},
+        {"vy_nm_per_s": 1e6},
+        {"vx_nm_per_s": -0.1},
+        {"line_jitter_nm": 5.1},
+        {"vx_px_per_s": 51.0},
+        {"line_jitter_px": 6.0},
+    ])
+    def test_drift_out_of_bounds_is_422(self, client, payload):
+        r = client.post("/api/simulation/drift", json=payload)
+        assert r.status_code == 422
+
+    def test_specimen_within_bounds_ok(self, client):
+        r = client.post("/api/simulation/specimen",
+                        json={"contamination_enabled": True,
+                              "contamination_rate": 20.0,
+                              "damage_rate": 10.0,
+                              "damage_dose_threshold": 3e4})
+        assert r.status_code == 200
+
+    @pytest.mark.parametrize("payload", [
+        {"contamination_rate": 20.1},
+        {"contamination_rate": -1.0},
+        {"damage_rate": 10.5},
+        {"damage_dose_threshold": 0.0},
+        {"damage_dose_threshold": 1e9},
+    ])
+    def test_specimen_out_of_bounds_is_422(self, client, payload):
+        r = client.post("/api/simulation/specimen", json=payload)
+        assert r.status_code == 422
+
+    def test_bounds_match_limits_module(self):
+        """The route bounds must track digital_twin.limits exactly."""
+        from app.digital_twin.limits import (
+            CONTAMINATION_MAX_RATE, DRIFT_MAX_NM_PER_S)
+        from app.routes.simulation import DriftSettings, SpecimenSettings
+
+        f = DriftSettings.model_fields["vx_nm_per_s"]
+        assert any(getattr(m, "le", None) == DRIFT_MAX_NM_PER_S
+                   for m in f.metadata)
+        f = SpecimenSettings.model_fields["contamination_rate"]
+        assert any(getattr(m, "le", None) == CONTAMINATION_MAX_RATE
+                   for m in f.metadata)

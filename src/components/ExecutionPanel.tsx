@@ -170,7 +170,7 @@ export const ExecutionPanel = memo(function ExecutionPanel({
                     </span>
                     {log.data?.stage && !log.data?.image_base64 && (
                       <div className="mt-1 text-xs text-slate-500 font-mono">
-                        Stage: X={log.data.stage.x_um.toFixed(2)} µm, Y={log.data.stage.y_um.toFixed(2)} µm
+                        Stage: X={log.data.stage.x_um.toFixed(3)} µm, Y={log.data.stage.y_um.toFixed(3)} µm
                       </div>
                     )}
                   </div>
@@ -189,7 +189,7 @@ export const ExecutionPanel = memo(function ExecutionPanel({
                     />
                     <div className="text-xs text-slate-400">
                       <div className="font-mono">
-                        Position: ({log.data.stage?.x_um?.toFixed(2) || '0.00'}, {log.data.stage?.y_um?.toFixed(2) || '0.00'}, {log.data.stage?.z_um?.toFixed(2) || '0.00'}) µm
+                        Position: ({log.data.stage?.x_um?.toFixed(3) ?? '—'}, {log.data.stage?.y_um?.toFixed(3) ?? '—'}, {log.data.stage?.z_um?.toFixed(3) ?? '—'}) µm
                       </div>
                       {(log.data.stage?.a !== undefined || log.data.stage?.b !== undefined) && (
                         <div className="font-mono text-violet-400">
@@ -265,7 +265,7 @@ export const ExecutionPanel = memo(function ExecutionPanel({
               )}
             </div>
             <div className="text-xs text-slate-400 font-mono text-right">
-              <div>({acquiredImages[selectedImage].x_um.toFixed(2)}, {acquiredImages[selectedImage].y_um.toFixed(2)}, {acquiredImages[selectedImage].z_um?.toFixed(2) || '0.00'}) µm</div>
+              <div>({acquiredImages[selectedImage].x_um.toFixed(3)}, {acquiredImages[selectedImage].y_um.toFixed(3)}, {acquiredImages[selectedImage].z_um?.toFixed(3) ?? '—'}) µm</div>
               {(acquiredImages[selectedImage].a !== undefined || acquiredImages[selectedImage].b !== undefined) && (
                 <div className="text-violet-400">
                   α={acquiredImages[selectedImage].a?.toFixed(1) || 0}° β={acquiredImages[selectedImage].b?.toFixed(1) || 0}°

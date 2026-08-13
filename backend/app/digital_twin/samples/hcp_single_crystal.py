@@ -6,7 +6,7 @@ real kinematical diffraction (hexagonal reciprocal lattice -> characteristic
 6-fold symmetry down the c-axis). Edge dislocations live in `dislocation_crystal`.
 """
 import numpy as np
-from .base import Sample, SampleMetadata, CrystalLattice, make_lamella_slab
+from .base import Sample, SampleMetadata, CrystalLattice, make_lamella_slab, atoms_in_requested_box
 from . import register
 
 
@@ -57,17 +57,14 @@ class HCPSingleCrystal(Sample):
         )
 
     def get_atoms_in_region(self, cx_um, cy_um, half_width_um, depth_nm):
-        """Clean Mg HCP lattice. Tile an approximately cubic region under the atom
-        cap (no random subsampling, which would smear the pattern). A cube keeps
-        the shape transform isotropic so off-axis zone-axis patterns stay sparse."""
-        from .base import tile_lattice_in_region
-        a1, a2, a3 = self.lattice.real_vectors
-        cell_vol = abs(np.dot(a1, np.cross(a2, a3)))
-        density = len(self.lattice.basis) / cell_vol
-        target = 90000.0  # under the 100k cap -> no random subsampling
-        side_A = float((target / max(1e-9, density)) ** (1.0 / 3.0))
-        half_A = side_A / 2.0
-        return tile_lattice_in_region(self.lattice, half_A, side_A)
+        """Atoms really present in the requested region (single source of truth for
+        both the atomic-column image and the diffraction pattern). Small imaging
+        FOV -> exactly those atoms; huge SAED aperture -> a representative cube."""
+        from .base import tile_lattice_in_region  # noqa: F401  (used indirectly)
+        half_A = max(1.0, float(half_width_um) * 1.0e4)
+        depth_A = max(1.0, float(depth_nm) * 10.0)
+        pos, Z, _rep = atoms_in_requested_box(self.lattice, half_A, depth_A)
+        return pos.astype(np.float64), Z.astype(np.int32)
 
     def generate_volume(self, D, H, W):
         p = self.params

@@ -97,7 +97,7 @@ class TestSampleRegistry:
         r = fresh_server.load_sample(name, D=D, H=H, W=W)
         assert r["loaded"] == name
         img = fresh_server.acquire_image("haadf")
-        assert img["shape"] == (512, 512)
+        assert img["shape"] == (1024, 1024)
         assert img["dtype"] == "uint16"
 
     @pytest.mark.parametrize(
@@ -108,15 +108,35 @@ class TestSampleRegistry:
         fresh_server.load_sample(name, D=D, H=H, W=W)
         fresh_server.set_mode("DIFF")
         img = fresh_server.acquire_image("haadf")
-        assert img["shape"] == (512, 512)
+        assert img["shape"] == (1024, 1024)
 
     def test_unknown_sample_raises(self, server):
         with pytest.raises(KeyError, match="Unknown sample"):
             server.load_sample("no_such_sample", D=D, H=H, W=W)
 
+    def test_file_backed_sample_loads_shipped_example(self, fresh_server):
+        # The default file_path resolves to the example polycrystal shipped
+        # under backend/sample_data/, regardless of the process cwd.
+        r = fresh_server.load_sample("atomsk_polycrystal", D=D, H=H, W=W)
+        assert r["loaded"] == "atomsk_polycrystal"
+        # auto_fit shrinks the world to the structure (~80 A wide -> ~11 nm)
+        assert fresh_server.sample_fov_um < 1.0
+        # the detector FOV is clamped to the shrunken world at load
+        assert (fresh_server.detectors["haadf"]["field_of_view_um"]
+                <= fresh_server.sample_fov_um + 1e-9)
+        # regression for the 0.38-voxel-dot bug: the structure must actually
+        # light up the frame, not render as a sub-voxel point (loose floor)
+        import base64 as _b64
+        img = fresh_server.acquire_image("haadf")
+        arr = np.frombuffer(_b64.b64decode(img["__ndarray_b64__"]),
+                            dtype=img["dtype"]).reshape(img["shape"]).astype(float)
+        bright = (arr > arr.mean() + arr.std()).mean()
+        assert bright > 0.02
+
     def test_file_backed_sample_fails_clearly_without_file(self, fresh_server):
         with pytest.raises(Exception, match="file not found"):
-            fresh_server.load_sample("atomsk_polycrystal", D=D, H=H, W=W)
+            fresh_server.load_sample("atomsk_polycrystal", D=D, H=H, W=W,
+                                     params={"file_path": "no/such/file.xyz"})
 
     def test_failed_load_keeps_previous_sample(self, server):
         server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
@@ -375,26 +395,26 @@ class TestThicknessWorkflow:
 
 
 # ---------------------------------------------------------------------------
-# Resolution windows (discrete 512/1024/2048)
+# Resolution windows (discrete 1024/2048/4096)
 # ---------------------------------------------------------------------------
 class TestResolutionWindows:
-    def test_default_resolution_is_512(self, fresh_server):
+    def test_default_resolution_is_1024(self, fresh_server):
         r = fresh_server.get_resolution()
-        assert r["resolution_px"] == 512
-        assert r["allowed"] == [512, 1024, 2048]
+        assert r["resolution_px"] == 1024
+        assert r["allowed"] == [1024, 2048, 4096]
 
     def test_set_resolution_changes_acquire_shape(self, fresh_server):
         fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_resolution(2048)
+        img = fresh_server.acquire_image("haadf")
+        assert img["shape"] == (2048, 2048)
         fresh_server.set_resolution(1024)
         img = fresh_server.acquire_image("haadf")
         assert img["shape"] == (1024, 1024)
-        fresh_server.set_resolution(512)
-        img = fresh_server.acquire_image("haadf")
-        assert img["shape"] == (512, 512)
 
-    @pytest.mark.parametrize("bad", [256, 768, 4096, 0, -512])
+    @pytest.mark.parametrize("bad", [256, 512, 768, 0, -1024])
     def test_invalid_resolution_rejected_with_allowed_list(self, fresh_server, bad):
-        with pytest.raises(ValueError, match=r"512, 1024, 2048"):
+        with pytest.raises(ValueError, match=r"1024, 2048, 4096"):
             fresh_server.set_resolution(bad)
 
     def test_rejected_resolution_leaves_setting_unchanged(self, fresh_server):
@@ -484,8 +504,8 @@ class TestEnvironmentThickness:
                                  thickness_nm=40.0)
         state = fresh_server.get_microscope_state()
         assert state["thickness"]["working_nm"] == pytest.approx(40.0)
-        assert state["resolution"]["resolution_px"] in (512, 1024, 2048)
-        assert state["resolution"]["allowed"] == [512, 1024, 2048]
+        assert state["resolution"]["resolution_px"] in (1024, 2048, 4096)
+        assert state["resolution"]["allowed"] == [1024, 2048, 4096]
 
 
 # ---------------------------------------------------------------------------
@@ -683,22 +703,22 @@ class TestRealDose:
         fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
         fresh_server.set_beam({"current_pA": 80.0}, relative=False)
         fresh_server.device_settings("haadf", dwell_us=20.0)
-        dose = self._dose_after_one_frame(fresh_server, fov_um=1.0, resolution_px=512)
+        dose = self._dose_after_one_frame(fresh_server, fov_um=1.0, resolution_px=1024)
         e_per_px = (80.0e-12 / 1.602e-19) * 20e-6
-        pix_A2 = ((1.0 * 1000.0 / 512) * 10.0) ** 2
+        pix_A2 = ((1.0 * 1000.0 / 1024) * 10.0) ** 2
         assert dose == pytest.approx(e_per_px / pix_A2, rel=1e-3)
 
     def test_higher_resolution_concentrates_dose(self, fresh_server):
-        """Same FOV, 512 -> 1024 px: 4x smaller pixel area, 4x the dose."""
+        """Same FOV, 1024 -> 2048 px: 4x smaller pixel area, 4x the dose."""
         fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        d512 = self._dose_after_one_frame(fresh_server, fov_um=2.0, resolution_px=512)
         d1024 = self._dose_after_one_frame(fresh_server, fov_um=2.0, resolution_px=1024)
-        assert d1024 == pytest.approx(4.0 * d512, rel=1e-3)
+        d2048 = self._dose_after_one_frame(fresh_server, fov_um=2.0, resolution_px=2048)
+        assert d2048 == pytest.approx(4.0 * d1024, rel=1e-3)
 
     def test_smaller_fov_concentrates_dose(self, fresh_server):
         fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        d_wide = self._dose_after_one_frame(fresh_server, fov_um=4.0, resolution_px=512)
-        d_narrow = self._dose_after_one_frame(fresh_server, fov_um=1.0, resolution_px=512)
+        d_wide = self._dose_after_one_frame(fresh_server, fov_um=4.0, resolution_px=1024)
+        d_narrow = self._dose_after_one_frame(fresh_server, fov_um=1.0, resolution_px=1024)
         assert d_narrow == pytest.approx(16.0 * d_wide, rel=1e-3)
 
     def test_damage_is_gradual_log_progression(self, fresh_server):
@@ -739,3 +759,78 @@ class TestRetunedPresets:
         assert fresh_server.get_specimen()["damage_rate"] == pytest.approx(0.8)
         fresh_server.set_environment("low_dose")
         assert fresh_server.get_specimen()["damage_dose_threshold"] == pytest.approx(5.0e3)
+
+
+# ---------------------------------------------------------------------------
+# v3 performance rewrites: exactness of PERF A / PERF B and spot scaling
+# ---------------------------------------------------------------------------
+class TestPerfRewritesExact:
+    def test_perf_a_projection_collapse_is_exact(self, fresh_server):
+        """PERF A relies on: sum_z bilinear(vol[z]) == bilinear(sum_z vol[z]).
+        Verify the identity on the real bilinear_sample and a real loaded
+        volume, at the same float32 precision the render path uses."""
+        from app.digital_twin.server import bilinear_sample
+
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        vol = np.asarray(fresh_server.vol)
+        rng = np.random.default_rng(0)
+        ys = rng.uniform(1, vol.shape[1] - 2, size=(64, 64)).astype(np.float32)
+        xs = rng.uniform(1, vol.shape[2] - 2, size=(64, 64)).astype(np.float32)
+        slow = np.zeros((64, 64), dtype=np.float32)
+        for z in range(vol.shape[0]):
+            slow += bilinear_sample(vol[z], ys, xs)
+        fast = bilinear_sample(vol.sum(axis=0, dtype=np.float32), ys, xs)
+        assert np.allclose(fast, slow, rtol=1e-4, atol=1e-2)
+
+    def test_perf_b_patch_local_matches_full_grid(self):
+        """Patch-local spot rendering must match the pre-change full-grid
+        evaluation to within 16-bit output quantisation (changelog §8.2)."""
+        from app.digital_twin.samples.fcc_single_crystal import FCCSingleCrystal
+        from app.digital_twin.server import kinematical_diffraction
+
+        lat = FCCSingleCrystal().lattice
+        kw = dict(out_size=512, tilt_a_deg=0.0, tilt_b_deg=0.0,
+                  spot_sigma_px=2.5)
+        patch = kinematical_diffraction(lat, **kw)
+        full = kinematical_diffraction(lat, spot_render_radius_sigma=1e9, **kw)
+        assert np.abs(patch - full).max() <= 1.0  # under one 16-bit step
+
+    def test_spot_sigma_default_scales_with_resolution(self):
+        """User decision (§8.4 applied): the default spot width scales with
+        the window so patterns look proportionally identical. Passing the
+        scaled sigma explicitly must reproduce the default exactly."""
+        from app.digital_twin.samples.fcc_single_crystal import FCCSingleCrystal
+        from app.digital_twin.server import kinematical_diffraction
+
+        lat = FCCSingleCrystal().lattice
+        for out_size in (256, 512):
+            auto = kinematical_diffraction(lat, out_size, 0.0, 0.0)
+            explicit = kinematical_diffraction(
+                lat, out_size, 0.0, 0.0,
+                spot_sigma_px=2.5 * (out_size / 1024.0))
+            assert np.array_equal(auto, explicit)
+
+    def test_beamstop_scales_with_resolution(self, fresh_server, monkeypatch):
+        """User decision (§8.4 applied): the stored beamstop radius is
+        calibrated at the 1024 window and scaled by out_size/1024 at render
+        time, so it covers the same FRACTION of the pattern at every
+        resolution. Spy on the render call to see the value actually used."""
+        import app.digital_twin.server as server_mod
+
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
+        fresh_server.set_mode("DIFF")
+
+        captured = []
+        orig = server_mod.diffraction_from_atoms
+
+        def spy(*args, **kwargs):
+            captured.append(float(kwargs["beamstop_radius_px"]))
+            return orig(*args, **kwargs)
+
+        monkeypatch.setattr(server_mod, "diffraction_from_atoms", spy)
+        fresh_server.set_resolution(1024)
+        fresh_server.acquire_image("haadf")
+        fresh_server.set_resolution(2048)
+        fresh_server.acquire_image("haadf")
+        assert captured[0] == pytest.approx(6.0)    # stored 6.0 at reference
+        assert captured[1] == pytest.approx(12.0)   # 2x window -> 2x pixels

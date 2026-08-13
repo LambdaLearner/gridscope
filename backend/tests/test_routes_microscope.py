@@ -89,10 +89,10 @@ class FakeControl:
         return {**self.get_diffraction_settings(), **kw}
 
     def get_resolution(self, device="haadf"):
-        return {"resolution_px": 512, "allowed": [512, 1024, 2048]}
+        return {"resolution_px": 1024, "allowed": [1024, 2048, 4096]}
 
     def set_resolution(self, resolution_px, device="haadf"):
-        return {"resolution_px": resolution_px, "allowed": [512, 1024, 2048]}
+        return {"resolution_px": resolution_px, "allowed": [1024, 2048, 4096]}
 
     def acquire_spectrum(self, ev_min=0.0, ev_max=1000.0, n_channels=1024,
                          cx_um=None, cy_um=None):
@@ -256,15 +256,15 @@ class TestResolutionAndSpectrum:
     def test_get_resolution(self, client):
         r = client.get("/api/microscope/resolution")
         assert r.status_code == 200
-        assert r.json()["resolution_px"] == 512
-        assert r.json()["allowed"] == [512, 1024, 2048]
+        assert r.json()["resolution_px"] == 1024
+        assert r.json()["allowed"] == [1024, 2048, 4096]
 
     def test_set_resolution_valid(self, client):
         r = client.post("/api/microscope/resolution", json={"resolution_px": 1024})
         assert r.status_code == 200
         assert r.json()["resolution_px"] == 1024
 
-    @pytest.mark.parametrize("bad", [256, 768, 4096, 0])
+    @pytest.mark.parametrize("bad", [256, 512, 768, 0])
     def test_set_resolution_invalid_is_422(self, client, bad):
         r = client.post("/api/microscope/resolution", json={"resolution_px": bad})
         assert r.status_code == 422

@@ -196,16 +196,37 @@ def tile_lattice_in_region(lattice, half_width_A, depth_A):
     shot rather than looping in Python.
     """
     a1, a2, a3 = lattice.real_vectors
-    # Cell-index bracket that conservatively covers the box
-    max_cell_xy = int(np.ceil(2.0 * half_width_A / min(np.linalg.norm(a1[:2]),
-                                                       np.linalg.norm(a2[:2]),
-                                                       1.0))) + 2
-    max_cell_z = int(np.ceil(depth_A / max(1e-6, abs(a3[2])))) + 2
+    # Cell-index bracket. A cell origin is  p = [i,j,k] @ A  with A = (a1;a2;a3),
+    # so the indices that can reach a point p are [i,j,k] = p @ inv(A). Evaluating
+    # the eight corners of the target box in those fractional coordinates gives
+    # the tightest integer range that can contribute, for any cell shape.
+    #
+    # (The previous bracket used `min(norm(a1[:2]), norm(a2[:2]), 1.0)`, which
+    # CAPS the assumed spacing at 1 A rather than flooring it, and `2*half_width`
+    # instead of `half_width`. For a 3.571 A cell that built ~76-85x more cells
+    # than needed -- 11.5 million to keep 203k atoms -- all discarded by the mask
+    # below. Same atoms out, seconds of wasted allocation.)
+    A = np.array([np.asarray(a1, float), np.asarray(a2, float), np.asarray(a3, float)])
+    hw = float(half_width_A); hz = float(depth_A) / 2.0
+    try:
+        Ainv = np.linalg.inv(A)
+        corners = np.array([[sx * hw, sy * hw, sz * hz]
+                            for sx in (-1.0, 1.0) for sy in (-1.0, 1.0)
+                            for sz in (-1.0, 1.0)])
+        frac = corners @ Ainv                       # fractional cell indices
+        lim = np.abs(frac).max(axis=0)
+        max_cell_i = int(np.ceil(lim[0])) + 1
+        max_cell_j = int(np.ceil(lim[1])) + 1
+        max_cell_k = int(np.ceil(lim[2])) + 1
+    except np.linalg.LinAlgError:                   # degenerate cell: be safe
+        sp = max(1e-6, min(np.linalg.norm(a1), np.linalg.norm(a2)))
+        max_cell_i = max_cell_j = int(np.ceil(2.0 * hw / sp)) + 2
+        max_cell_k = int(np.ceil(depth_A / max(1e-6, abs(a3[2])))) + 2
 
     # Build cell-index grid
-    ii = np.arange(-max_cell_xy, max_cell_xy + 1)
-    jj = np.arange(-max_cell_xy, max_cell_xy + 1)
-    kk = np.arange(-max_cell_z, max_cell_z + 1)
+    ii = np.arange(-max_cell_i, max_cell_i + 1)
+    jj = np.arange(-max_cell_j, max_cell_j + 1)
+    kk = np.arange(-max_cell_k, max_cell_k + 1)
     I, J, K = np.meshgrid(ii, jj, kk, indexing='ij')
     # Cell origins (N, 3)
     cell_origins = (I[..., None] * a1 + J[..., None] * a2 + K[..., None] * a3).reshape(-1, 3)
@@ -232,6 +253,95 @@ def tile_lattice_in_region(lattice, half_width_A, depth_A):
 # ============================================================================
 # Default Au FCC lattice for filling crystalline nanoparticles with atoms.
 _AU_FCC = None
+
+
+def atoms_in_requested_box(lattice, half_width_A, depth_A, max_atoms=250000):
+    """Atoms filling the REQUESTED physical box, or a representative sub-box.
+
+    Returns (positions_A, Z, is_representative).
+
+    * If the requested box holds <= max_atoms, the atoms returned are exactly the
+      atoms in that box -- the honest, region-accurate answer. This is the case
+      for IMAGING fields of view (a few nm across), so the high-magnification
+      image shows the real atoms that are really there.
+    * If the request is enormous -- a selected-area DIFFRACTION aperture is
+      ~0.4 um across and contains ~1e8-1e9 atoms -- we cannot enumerate them, so we
+      return a REPRESENTATIVE cube centred on the same point (is_representative
+      =True). This is the standard "representative volume" approximation and is
+      what the kinematical pattern is computed from.
+    """
+    a1, a2, a3 = (np.asarray(v, float) for v in lattice.real_vectors)
+    cell_vol = abs(np.dot(a1, np.cross(a2, a3)))
+    density = len(lattice.basis) / max(cell_vol, 1e-9)      # atoms per A^3
+    n_est = density * (2.0 * half_width_A) ** 2 * max(depth_A, 1e-6)
+    if n_est <= max_atoms:
+        pos, Z = tile_lattice_in_region(lattice, half_width_A, depth_A)
+        return pos, Z, False
+    side_A = float((max_atoms / max(density, 1e-12)) ** (1.0 / 3.0))
+    pos, Z = tile_lattice_in_region(lattice, side_A / 2.0, min(depth_A, side_A))
+    return pos, Z, True
+
+
+def rotation_taking_to_beam(zone):
+    """Rotation matrix R mapping direction `zone` onto the beam (+z).
+
+    Applied to positions as `pos @ R.T`, so the requested crystal direction ends
+    up parallel to the optic axis and the projection down z is the zone-axis
+    pattern.
+
+    Canonical home (R3): this was previously duplicated in
+    `dislocation_crystal.py` and, under the name `_rot_axis_to_beam`, in
+    `polycrystal_grains.py`. Both re-export it, so existing imports still work.
+    """
+    v0 = np.asarray(zone, dtype=float)
+    n = np.linalg.norm(v0)
+    if n < 1e-12:
+        return np.eye(3)
+    v0 = v0 / n
+    beam = np.array([0.0, 0.0, 1.0])
+    v = np.cross(v0, beam)
+    c = float(np.dot(v0, beam))
+    s = float(np.linalg.norm(v))
+    if s < 1e-12:                      # already parallel (or antiparallel) to z
+        return np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    K = np.array([[0.0, -v[2], v[1]],
+                  [v[2], 0.0, -v[0]],
+                  [-v[1], v[0], 0.0]])
+    return np.eye(3) + K + K @ K * ((1.0 - c) / (s * s))
+
+
+def projected_column_spacing_A(lattice, nmax=2):
+    """Minimum distance between DISTINCT atomic COLUMNS projected along the beam.
+
+    This is the spacing that actually has to be resolved in a high-magnification
+    image, and it is NOT the same as the cell-vector length: e.g. FCC down [111]
+    projects (via its ABC stacking) to columns only a/sqrt(6) = 1.46 A apart, not
+    a = 3.57 A. The server's column renderer must gate on THIS number, otherwise
+    it draws columns that are below Nyquist and they alias into a moire grid.
+
+    Canonical home (R3): previously duplicated verbatim in
+    `polycrystal_grains.py` and `dislocation_crystal.py`. Both re-export it.
+
+    Any sample that can be viewed down a zone axis should expose this through a
+    `column_spacing_A()` method -- that is the hook the server looks for.
+    """
+    a1, a2, a3 = (np.asarray(v, float) for v in lattice.real_vectors)
+    pts = []
+    for i in range(-nmax, nmax + 1):
+        for j in range(-nmax, nmax + 1):
+            for k in range(-nmax, nmax + 1):
+                o = i * a1 + j * a2 + k * a3
+                for frac, _Z in lattice.basis:
+                    p = o + frac[0] * a1 + frac[1] * a2 + frac[2] * a3
+                    pts.append(p[:2])
+    pts = np.unique(np.round(np.asarray(pts), 3), axis=0)
+    if len(pts) < 2:
+        return float(np.linalg.norm(a1))
+    c = pts[np.argmin(np.linalg.norm(pts, axis=1))]
+    d = np.linalg.norm(pts - c, axis=1)
+    d = d[d > 1e-3]
+    return float(d.min()) if len(d) else float(np.linalg.norm(a1))
+
 
 def _get_au_fcc():
     global _AU_FCC

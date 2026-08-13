@@ -44,11 +44,21 @@ import {
   getAbtemAvailability,
 } from '../api/simulation';
 import { ApiError } from '../api/client';
+import {
+  DEFAULT_RESOLUTION,
+  FALLBACK_ALLOWED_RESOLUTIONS,
+  OFFLINE_CAPTURE_RESOLUTION,
+} from '../api/limits';
 import { LinkedFovMag } from './controls/LinkedFovMag';
 import { SpectrumPlot } from './controls/SpectrumPlot';
 
 type ImagingMode = 'IMG' | 'DIFF' | 'EELS';
 type DiffEngine = 'kinematical' | 'abtem';
+
+/** Format a length in nm: whole numbers with separators at ≥100 nm,
+ *  one decimal below (e.g. 20000 → "20,000", 11.4 → "11.4"). */
+const formatNm = (nm: number) =>
+  nm >= 100 ? Math.round(nm).toLocaleString('en-US') : nm.toFixed(1);
 
 interface MicroscopeControlsPanelProps {
   session: SessionSnapshot | null;
@@ -78,7 +88,8 @@ export function MicroscopeControlsPanel({
   const [notice, setNotice] = useState<string | null>(null);
   const [fov, setFov] = useState(20);
   const [moveStep, setMoveStep] = useState(5);
-  const [tiltStep, setTiltStep] = useState(5);
+  const [tiltStep, setTiltStep] = useState(1);
+  const [focusStep, setFocusStep] = useState(1);
   const [beamCurrent, setBeamCurrent] = useState(80);
   const [beamVoltage, setBeamVoltage] = useState(200);
   // Live mode (spec rev 4): re-acquire continuously; the recommended way to
@@ -108,9 +119,14 @@ export function MicroscopeControlsPanel({
   const tiltA = state?.stage?.a ?? 0;
   const tiltB = state?.stage?.b ?? 0;
   const tiltLimit = limits?.a ?? 30;
-  const resolutionPx = state?.resolution?.resolution_px ?? 512;
-  const allowedResolutions = state?.resolution?.allowed ?? [512, 1024, 2048];
+  const resolutionPx = state?.resolution?.resolution_px ?? DEFAULT_RESOLUTION;
+  const allowedResolutions = state?.resolution?.allowed ?? FALLBACK_ALLOWED_RESOLUTIONS;
   const controlsEnabled = connected && sampleRegistered && !runActive && !isLoading;
+  const stageXUm = (state?.stage?.x ?? 0) * 1e6;
+  const stageYUm = (state?.stage?.y ?? 0) * 1e6;
+  // 4096 is reserved for offline capture (Save TIFF): frames take seconds
+  // untilted and minutes tilted, far beyond Live mode's cadence.
+  const liveAllowed = resolutionPx < OFFLINE_CAPTURE_RESOLUTION;
 
   // Grey out the abTEM toggle when the optional dependency is missing (501).
   useEffect(() => {
@@ -152,12 +168,27 @@ export function MicroscopeControlsPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live]);
 
-  // Live only makes sense for image modes while the instrument is available.
+  // Live only makes sense for image modes while the instrument is available,
+  // and never at the offline-capture resolution (4096).
   useEffect(() => {
-    if (live && (imagingMode === 'EELS' || !connected || !sampleRegistered || runActive)) {
+    if (live && (imagingMode === 'EELS' || !connected || !sampleRegistered || runActive || !liveAllowed)) {
       setLive(false);
     }
-  }, [live, imagingMode, connected, sampleRegistered, runActive]);
+  }, [live, imagingMode, connected, sampleRegistered, runActive, liveAllowed]);
+
+  // After a script run finishes, the stage is wherever the script left it —
+  // sync the viewer's position overlay so it doesn't show the pre-run values.
+  const prevRunActive = useRef(runActive);
+  useEffect(() => {
+    const runJustFinished = prevRunActive.current && !runActive;
+    prevRunActive.current = runActive;
+    if (runJustFinished && state?.stage) {
+      const s = state.stage;
+      setImageInfo((prev) =>
+        prev ? { ...prev, x_um: s.x * 1e6, y_um: s.y * 1e6, a: s.a, b: s.b } : prev,
+      );
+    }
+  }, [runActive, state?.stage]);
 
   const classifyError = (e: unknown, fallback: string): PanelError => {
     if (e instanceof ApiError) {
@@ -184,7 +215,12 @@ export function MicroscopeControlsPanel({
 
   const doAcquire = async () => {
     if (imagingMode === 'EELS') {
-      const result = await acquireSpectrum({ ev_min: evMin, ev_max: evMax, n_channels: nChannels });
+      // Park the probe at the stage position so the spectrum matches the
+      // position readout (omitting cx/cy would probe the sample centre).
+      const result = await acquireSpectrum({
+        ev_min: evMin, ev_max: evMax, n_channels: nChannels,
+        cx_um: stageXUm, cy_um: stageYUm,
+      });
       setSpectrum(result);
       onAcquired?.();
       return;
@@ -203,18 +239,34 @@ export function MicroscopeControlsPanel({
     onAcquired?.();
   };
 
-  const handleAcquire = () =>
-    runAction(
+  const handleAcquire = () => {
+    // A tilted 4096 frame cannot use the twin's untilted fast path and takes
+    // minutes, blocking the instrument for the duration — confirm first.
+    if (
+      imagingMode === 'IMG' &&
+      resolutionPx >= OFFLINE_CAPTURE_RESOLUTION &&
+      (tiltA !== 0 || tiltB !== 0) &&
+      !window.confirm(
+        `Acquiring at ${resolutionPx} px with the stage tilted ` +
+        `(α=${tiltA.toFixed(1)}°, β=${tiltB.toFixed(1)}°) can take several ` +
+        'minutes and blocks the microscope until it finishes.\n\n' +
+        'Reset the tilt or drop the resolution for interactive work. Acquire anyway?',
+      )
+    ) {
+      return;
+    }
+    return runAction(
       imagingMode === 'EELS'
         ? 'Acquiring spectrum...'
         : imagingMode === 'DIFF'
           ? 'Computing diffraction (may take a few seconds)...'
-          : resolutionPx >= 2048
-            ? 'Acquiring (2048 px, ~30 s)...'
+          : resolutionPx >= OFFLINE_CAPTURE_RESOLUTION
+            ? `Acquiring (${resolutionPx} px${tiltA !== 0 || tiltB !== 0 ? ', tilted — minutes' : ', several seconds'})...`
             : 'Acquiring...',
       doAcquire,
       'Failed to acquire',
     );
+  };
 
   // abTEM path: explicit compute button (seconds to tens of seconds), never
   // auto-refresh. Stage tilt is applied to the atoms server-side in the
@@ -224,7 +276,7 @@ export function MicroscopeControlsPanel({
       const r = await computeAbtemDiffraction({ num_frozen_phonons: frozenPhonons });
       setCurrentImage(`data:image/png;base64,${r.image.image_base64}`);
       setImageInfo({
-        x_um: 0, y_um: 0, fov_um: fov,
+        x_um: stageXUm, y_um: stageYUm, fov_um: fov,
         a: r.state.tilt_a_deg, b: r.state.tilt_b_deg, mode: 'DIFF',
       });
       setAbtemMeta(
@@ -336,16 +388,17 @@ export function MicroscopeControlsPanel({
 
   const magnification = state?.detectors?.haadf?.magnification;
 
-  // FOV range: 100 nm to 50 µm. Below 5 µm the ±5 µm buttons would be
+  // FOV range: 1 nm to 50 µm (atomistic samples like the Atomsk polycrystal
+  // declare worlds of only ~10 nm). Below 5 µm the ±5 µm steps would be
   // useless, so zoom steps halve/double there instead.
-  const FOV_MIN_UM = 0.1;
+  const FOV_MIN_UM = 0.001;
   const FOV_MAX_UM = 50;
   const zoomInFov = () =>
-    handleFovChange(Math.max(FOV_MIN_UM, fov > 5 ? fov - 5 : +(fov / 2).toFixed(2)));
+    handleFovChange(Math.max(FOV_MIN_UM, fov > 5 ? fov - 5 : +(fov / 2).toFixed(4)));
   const zoomOutFov = () =>
-    handleFovChange(Math.min(FOV_MAX_UM, fov < 5 ? +(fov * 2).toFixed(2) : fov + 5));
-  const formatFov = (value: number) =>
-    value < 1 ? `${Math.round(value * 1000)} nm` : `${value} µm`;
+    handleFovChange(Math.min(FOV_MAX_UM, fov < 5 ? +(fov * 2).toFixed(4) : fov + 5));
+  // FOV is displayed in nm (the natural unit at imaging scale).
+  const formatFov = (valueUm: number) => `${formatNm(valueUm * 1000)} nm`;
 
   return (
     <div className="bg-slate-900 rounded-xl border border-slate-700 overflow-hidden">
@@ -390,7 +443,7 @@ export function MicroscopeControlsPanel({
             }`}
           >
             <ImageIcon className="w-3 h-3" />
-            Imaging
+            STEM
           </button>
           <button
             onClick={() => handleModeChange('DIFF')}
@@ -400,7 +453,7 @@ export function MicroscopeControlsPanel({
             }`}
           >
             <Sparkles className="w-3 h-3" />
-            Diffraction
+            SAED
           </button>
           <button
             onClick={() => handleModeChange('EELS')}
@@ -446,8 +499,13 @@ export function MicroscopeControlsPanel({
         )}
 
         {imageInfo && (
-          <div className="absolute bottom-2 left-2 bg-black/80 text-white text-xs px-2 py-1 rounded font-mono">
-            ({imageInfo.x_um.toFixed(1)}, {imageInfo.y_um.toFixed(1)}) µm • FOV: {imageInfo.fov_um.toFixed(1)} µm
+          <div
+            className="absolute bottom-2 left-2 bg-black/80 text-white text-xs px-2 py-1 rounded font-mono"
+            data-testid="position-overlay"
+          >
+            {/* x/y to 1 nm (0.001 µm); FOV in nm */}
+            ({imageInfo.x_um.toFixed(3)}, {imageInfo.y_um.toFixed(3)}) µm
+            {` • FOV: ${formatNm(imageInfo.fov_um * 1000)} nm`}
             {` • α=${imageInfo.a.toFixed(1)}° β=${imageInfo.b.toFixed(1)}°`}
           </div>
         )}
@@ -458,7 +516,7 @@ export function MicroscopeControlsPanel({
           }`}
         >
           {imagingMode === 'DIFF' ? <Sparkles className="w-3 h-3" /> : imagingMode === 'EELS' ? <Activity className="w-3 h-3" /> : <ImageIcon className="w-3 h-3" />}
-          {imagingMode === 'DIFF' ? (abtemMeta ? 'Diffraction (abTEM)' : 'Diffraction') : imagingMode === 'EELS' ? 'EELS' : 'Imaging'}
+          {imagingMode === 'DIFF' ? (abtemMeta ? 'SAED (abTEM)' : 'SAED parallel beam') : imagingMode === 'EELS' ? 'EELS' : 'STEM imaging'}
         </div>
 
         {abtemMeta && imagingMode === 'DIFF' && (
@@ -504,8 +562,12 @@ export function MicroscopeControlsPanel({
           {imagingMode !== 'EELS' && (
             <button
               onClick={() => setLive((v) => !v)}
-              disabled={!connected || !sampleRegistered || runActive}
-              title="Continuously re-acquire (~300 ms cadence, never overlapping). The recommended way to watch drift."
+              disabled={!connected || !sampleRegistered || runActive || !liveAllowed}
+              title={
+                liveAllowed
+                  ? 'Continuously re-acquire (~300 ms cadence, never overlapping). The recommended way to watch drift.'
+                  : `Live is unavailable at ${resolutionPx} px — that window is for offline capture (Save TIFF). Drop to a lower resolution.`
+              }
               className={`flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg transition-colors text-sm font-medium ${
                 live
                   ? 'bg-red-600 hover:bg-red-700 text-white'
@@ -581,12 +643,16 @@ export function MicroscopeControlsPanel({
                 key={px}
                 onClick={() => handleResolutionChange(px)}
                 disabled={!controlsEnabled}
-                title={px >= 1024 ? `${px} px (slower${px >= 2048 ? ', ~30 s/frame' : ''})` : `${px} px`}
+                title={
+                  px >= OFFLINE_CAPTURE_RESOLUTION
+                    ? `${px} px — offline capture (Save TIFF). Frames take seconds untilted, minutes tilted; Live mode is disabled.`
+                    : `${px} px${px >= 2048 ? ' (slower frames)' : ''}`
+                }
                 className={`flex-1 px-2 py-1.5 text-xs font-mono transition-colors ${
                   resolutionPx === px ? 'bg-cyan-600 text-white' : 'bg-slate-700 text-slate-400 hover:bg-slate-600'
                 }`}
               >
-                {px}{px >= 1024 ? '·slow' : ''}
+                {px}{px >= OFFLINE_CAPTURE_RESOLUTION ? '·offline' : ''}
               </button>
             ))}
           </div>
@@ -654,6 +720,8 @@ export function MicroscopeControlsPanel({
               disabled={!controlsEnabled}
               className="bg-slate-700 text-white text-xs rounded px-2 py-1 border-none focus:ring-1 focus:ring-cyan-500 disabled:opacity-50"
             >
+              <option value={0.001}>1 nm</option>
+              <option value={0.01}>10 nm</option>
               <option value={0.1}>100 nm</option>
               <option value={0.5}>500 nm</option>
               <option value={1}>1 µm</option>
@@ -705,39 +773,39 @@ export function MicroscopeControlsPanel({
               {((state?.stage?.z ?? 0) * 1e6).toFixed(2)} µm
             </span>
           </div>
-          <div className="grid grid-cols-4 gap-1.5">
-            <button
-              onClick={() => handleFocus(-25)}
+          <div className="flex items-center gap-2">
+            <select
+              value={focusStep}
+              onChange={(e) => setFocusStep(Number(e.target.value))}
               disabled={!controlsEnabled}
-              title="Coarse focus −25 µm"
-              className="px-2 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs text-white font-mono transition-colors"
+              aria-label="Focus step"
+              className="bg-slate-700 text-white text-xs rounded px-2 py-1 border-none focus:ring-1 focus:ring-cyan-500 disabled:opacity-50"
             >
-              −25
-            </button>
-            <button
-              onClick={() => handleFocus(-0.25)}
-              disabled={!controlsEnabled}
-              title="Fine focus −0.25 µm"
-              className="px-2 py-1.5 bg-slate-700 hover:bg-cyan-700 disabled:opacity-50 rounded text-xs text-white font-mono transition-colors"
-            >
-              −0.25
-            </button>
-            <button
-              onClick={() => handleFocus(0.25)}
-              disabled={!controlsEnabled}
-              title="Fine focus +0.25 µm"
-              className="px-2 py-1.5 bg-slate-700 hover:bg-cyan-700 disabled:opacity-50 rounded text-xs text-white font-mono transition-colors"
-            >
-              +0.25
-            </button>
-            <button
-              onClick={() => handleFocus(25)}
-              disabled={!controlsEnabled}
-              title="Coarse focus +25 µm"
-              className="px-2 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs text-white font-mono transition-colors"
-            >
-              +25
-            </button>
+              <option value={0.1}>0.1 µm</option>
+              <option value={0.5}>0.5 µm</option>
+              <option value={1}>1 µm</option>
+              <option value={5}>5 µm</option>
+              <option value={10}>10 µm</option>
+              <option value={25}>25 µm</option>
+            </select>
+            <div className="flex-1 grid grid-cols-2 gap-1.5">
+              <button
+                onClick={() => handleFocus(-focusStep)}
+                disabled={!controlsEnabled}
+                title={`Focus −${focusStep} µm`}
+                className="px-2 py-1.5 bg-slate-700 hover:bg-cyan-700 disabled:opacity-50 rounded text-xs text-white font-mono transition-colors"
+              >
+                −{focusStep}
+              </button>
+              <button
+                onClick={() => handleFocus(focusStep)}
+                disabled={!controlsEnabled}
+                title={`Focus +${focusStep} µm`}
+                className="px-2 py-1.5 bg-slate-700 hover:bg-cyan-700 disabled:opacity-50 rounded text-xs text-white font-mono transition-colors"
+              >
+                +{focusStep}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -771,10 +839,10 @@ export function MicroscopeControlsPanel({
               disabled={!controlsEnabled}
               className="bg-slate-700 text-white text-xs rounded px-2 py-1 border-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50"
             >
+              <option value={0.1}>0.1°</option>
+              <option value={0.5}>0.5°</option>
               <option value={1}>1°</option>
-              <option value={5}>5°</option>
-              <option value={10}>10°</option>
-              <option value={15}>15°</option>
+              <option value={2}>2°</option>
             </select>
 
             <div className="flex-1 grid grid-cols-2 gap-2">

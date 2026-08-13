@@ -17,7 +17,7 @@ interface LinkedFovMagProps {
  * committing (Enter / blur) applies the value. Spec §2.4.
  */
 export function LinkedFovMag({
-  fovUm, onCommit, disabled, minFovUm = 0.005, maxFovUm = 100,
+  fovUm, onCommit, disabled, minFovUm = 0.001, maxFovUm = 100,
 }: LinkedFovMagProps) {
   const [fovText, setFovText] = useState(fovUm.toFixed(3));
   const [magText, setMagText] = useState((fovUmToMag(fovUm) / 1e3).toFixed(1));

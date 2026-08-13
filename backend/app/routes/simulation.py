@@ -12,6 +12,14 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter
 from pydantic import BaseModel, Field, model_validator
 
+from ..digital_twin.limits import (
+    CONTAMINATION_MAX_RATE,
+    DAMAGE_DOSE_THRESHOLD_MAX,
+    DAMAGE_DOSE_THRESHOLD_MIN,
+    DAMAGE_MAX_RATE,
+    DRIFT_MAX_JITTER_NM,
+    DRIFT_MAX_NM_PER_S,
+)
 from ..services import abtem_service
 from ..services import twin_session as ts
 
@@ -58,23 +66,29 @@ class SetEnvironmentRequest(BaseModel):
 
 
 class SpecimenSettings(BaseModel):
+    # Bounds live in digital_twin/limits.py (shared with the twin and
+    # mirrored by the frontend sliders). Scripts hit this surface too, so
+    # an absurd rate must 422 here, not render garbage.
     beam_damage_enabled: Optional[bool] = None
-    damage_dose_threshold: Optional[float] = None
-    damage_rate: Optional[float] = None
+    damage_dose_threshold: Optional[float] = Field(
+        None, ge=DAMAGE_DOSE_THRESHOLD_MIN, le=DAMAGE_DOSE_THRESHOLD_MAX)
+    damage_rate: Optional[float] = Field(None, ge=0.0, le=DAMAGE_MAX_RATE)
     contamination_enabled: Optional[bool] = None
-    contamination_rate: Optional[float] = None
+    contamination_rate: Optional[float] = Field(
+        None, ge=0.0, le=CONTAMINATION_MAX_RATE)
 
 
 class DriftSettings(BaseModel):
     # Physical interface (preferred): TEM-realistic drift is 0-10 nm/s;
     # the cap leaves headroom for stress tests without allowing absurdity.
-    vx_nm_per_s: Optional[float] = Field(None, ge=0.0, le=50.0)
-    vy_nm_per_s: Optional[float] = Field(None, ge=0.0, le=50.0)
-    line_jitter_nm: Optional[float] = Field(None, ge=0.0, le=5.0)
-    # Legacy volume-pixel interface (kept for back-compat)
-    vx_px_per_s: Optional[float] = None
-    vy_px_per_s: Optional[float] = None
-    line_jitter_px: Optional[float] = None
+    vx_nm_per_s: Optional[float] = Field(None, ge=0.0, le=DRIFT_MAX_NM_PER_S)
+    vy_nm_per_s: Optional[float] = Field(None, ge=0.0, le=DRIFT_MAX_NM_PER_S)
+    line_jitter_nm: Optional[float] = Field(None, ge=0.0, le=DRIFT_MAX_JITTER_NM)
+    # Legacy volume-pixel interface (kept for back-compat). Bounded too:
+    # 1 volume px is ~26 nm, so 50 px/s already far exceeds the physical cap.
+    vx_px_per_s: Optional[float] = Field(None, ge=0.0, le=50.0)
+    vy_px_per_s: Optional[float] = Field(None, ge=0.0, le=50.0)
+    line_jitter_px: Optional[float] = Field(None, ge=0.0, le=5.0)
     enabled: Optional[bool] = None
     reset_accum: bool = False
 

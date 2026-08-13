@@ -161,17 +161,16 @@ describe('MicroscopeControlsPanel', () => {
     expect(twin.acquireImage).not.toHaveBeenCalled();
   });
 
-  it('allows fields of view down to 100 nm', () => {
+  it('allows fields of view down to 1 nm (atomistic samples)', () => {
     const { container } = render(
       <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
     );
     const sliders = container.querySelectorAll('input[type="range"]');
     const fovSlider = Array.from(sliders).find(
-      (s) => (s as HTMLInputElement).min === '0.1',
+      (s) => (s as HTMLInputElement).min === '0.001',
     ) as HTMLInputElement | undefined;
     expect(fovSlider).toBeTruthy();
-    expect(fovSlider!.min).toBe('0.1'); // 100 nm
-    expect(fovSlider!.step).toBe('0.1');
+    expect(fovSlider!.min).toBe('0.001'); // 1 nm
     expect(fovSlider!.max).toBe('50');
   });
 
@@ -193,13 +192,15 @@ describe('MicroscopeControlsPanel — v6+ features', () => {
     state: { ...SESSION.state!, mode: 'DIFF' },
   };
 
-  it('offers all three modes including EELS', () => {
+  it('offers all three modes labelled STEM / SAED / EELS', () => {
     render(
       <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
     );
-    expect(screen.getByRole('button', { name: /Imaging/i })).toBeTruthy();
-    expect(screen.getByRole('button', { name: /Diffraction/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /STEM/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /SAED/ })).toBeTruthy();
     expect(screen.getByRole('button', { name: /EELS/i })).toBeTruthy();
+    // viewer badge names the technique explicitly
+    expect(screen.getByText('STEM imaging')).toBeTruthy();
   });
 
   it('renders the discrete resolution windows from the session state', () => {
@@ -207,26 +208,27 @@ describe('MicroscopeControlsPanel — v6+ features', () => {
       ...SESSION,
       state: {
         ...SESSION.state!,
-        resolution: { resolution_px: 512, allowed: [512, 1024, 2048] },
+        resolution: { resolution_px: 1024, allowed: [1024, 2048, 4096] },
       },
     };
     render(
       <MicroscopeControlsPanel session={withRes} sampleRegistered={true} runActive={false} />,
     );
-    expect(screen.getByRole('button', { name: /^512$/ })).toBeTruthy();
-    expect(screen.getByRole('button', { name: /1024/ })).toBeTruthy();
-    expect(screen.getByRole('button', { name: /2048/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /^1024$/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /^2048$/ })).toBeTruthy();
+    // 4096 is labelled as the offline-capture window
+    expect(screen.getByRole('button', { name: /4096·offline/ })).toBeTruthy();
   });
 
   it('changes resolution through the control API', async () => {
     vi.mocked(twin.setResolution).mockResolvedValue({
-      success: true, resolution_px: 1024, allowed: [512, 1024, 2048],
+      success: true, resolution_px: 2048, allowed: [1024, 2048, 4096],
     });
     render(
       <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
     );
-    fireEvent.click(screen.getByRole('button', { name: /1024/ }));
-    await waitFor(() => expect(twin.setResolution).toHaveBeenCalledWith(1024));
+    fireEvent.click(screen.getByRole('button', { name: /^2048$/ }));
+    await waitFor(() => expect(twin.setResolution).toHaveBeenCalledWith(2048));
   });
 
   it('shows the kinematical⇄abTEM engine toggle in DIFF mode', async () => {
@@ -297,8 +299,9 @@ describe('MicroscopeControlsPanel — v6+ features', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: /^Acquire$/i }));
     await waitFor(() => {
+      // probes the STAGE position, not the sample centre (position-truth fix)
       expect(twin.acquireSpectrum).toHaveBeenCalledWith({
-        ev_min: 0, ev_max: 1000, n_channels: 1024,
+        ev_min: 0, ev_max: 1000, n_channels: 1024, cx_um: 0, cy_um: 0,
       });
       expect(screen.getByTestId('spectrum-plot')).toBeTruthy();
       expect(screen.getByTestId('edge-Fe-L')).toBeTruthy();
@@ -317,9 +320,16 @@ describe('MicroscopeControlsPanel — v2 addenda (z, Live, TIFF, dose meter)', (
       <MicroscopeControlsPanel session={withZ} sampleRegistered={true} runActive={false} />,
     );
     expect(screen.getByTestId('z-readout').textContent).toMatch(/\+1\.75 µm/);
-    fireEvent.click(screen.getByTitle('Fine focus +0.25 µm'));
+    // default step is 1 µm; the ± buttons apply the selected step
+    fireEvent.click(screen.getByTitle('Focus +1 µm'));
     await waitFor(() => {
-      expect(twin.setStagePosition).toHaveBeenCalledWith({ z: 0.25e-6 }, true);
+      expect(twin.setStagePosition).toHaveBeenCalledWith({ z: 1e-6 }, true);
+    });
+    // switching the step changes the applied nudge
+    fireEvent.change(screen.getByLabelText('Focus step'), { target: { value: '0.1' } });
+    fireEvent.click(screen.getByTitle('Focus −0.1 µm'));
+    await waitFor(() => {
+      expect(twin.setStagePosition).toHaveBeenCalledWith({ z: -0.1e-6 }, true);
     });
   });
 
@@ -368,8 +378,8 @@ describe('MicroscopeControlsPanel — v2 addenda (z, Live, TIFF, dose meter)', (
         ...SESSION.state!,
         specimen: {
           beam_damage_enabled: 1, contamination_enabled: 0,
-          damage_dose_threshold: 3e4, max_accumulated_dose: 1.5e4,
-          max_contamination: 0,
+          damage_dose_threshold: 3e4, damage_rate: 1, contamination_rate: 1,
+          max_accumulated_dose: 1.5e4, max_contamination: 0,
         },
       },
     };
@@ -388,7 +398,8 @@ describe('MicroscopeControlsPanel — v2 addenda (z, Live, TIFF, dose meter)', (
         ...SESSION.state!,
         specimen: {
           beam_damage_enabled: 0, contamination_enabled: 0,
-          damage_dose_threshold: 3e4, max_accumulated_dose: 0, max_contamination: 0,
+          damage_dose_threshold: 3e4, damage_rate: 1, contamination_rate: 1,
+          max_accumulated_dose: 0, max_contamination: 0,
         },
       },
     };
@@ -405,5 +416,99 @@ describe('MicroscopeControlsPanel — v2 addenda (z, Live, TIFF, dose meter)', (
     const select = screen.getByLabelText('Accelerating voltage') as HTMLSelectElement;
     const values = Array.from(select.options).map((o) => o.value);
     expect(values).toEqual(['60', '80', '120', '200', '300']);
+  });
+});
+
+describe('MicroscopeControlsPanel — v3 integration (steps, units, 4096 policy)', () => {
+  it('offers the fine tilt steps 0.1/0.5/1/2°', () => {
+    const { container } = render(
+      <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    const tiltSelect = Array.from(container.querySelectorAll('select')).find((sel) =>
+      Array.from(sel.options).some((o) => o.textContent === '0.1°'),
+    )!;
+    expect(Array.from(tiltSelect.options).map((o) => o.textContent)).toEqual([
+      '0.1°', '0.5°', '1°', '2°',
+    ]);
+  });
+
+  it('offers focus steps 0.1/0.5/1/5/10/25 µm', () => {
+    render(
+      <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    const focusSelect = screen.getByLabelText('Focus step') as HTMLSelectElement;
+    expect(Array.from(focusSelect.options).map((o) => o.textContent)).toEqual([
+      '0.1 µm', '0.5 µm', '1 µm', '5 µm', '10 µm', '25 µm',
+    ]);
+  });
+
+  it('tilts by the selected fine step', async () => {
+    const { container } = render(
+      <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    const tiltSelect = Array.from(container.querySelectorAll('select')).find((sel) =>
+      Array.from(sel.options).some((o) => o.textContent === '0.1°'),
+    )!;
+    fireEvent.change(tiltSelect, { target: { value: '0.5' } });
+    fireEvent.click(screen.getByTitle('Tilt α +0.5°'));
+    await waitFor(() => {
+      expect(twin.setStagePosition).toHaveBeenCalledWith({ a: 0.5, b: 0 }, false);
+    });
+  });
+
+  it('shows position to 1 nm and FOV in nm in the viewer overlay', async () => {
+    vi.mocked(twin.acquireImage).mockResolvedValue({
+      success: true,
+      device: 'haadf',
+      image: { image_base64: 'abc', width: 1024, height: 1024, dtype: 'uint16' },
+      stage: { x_um: 1.2345, y_um: -0.0011, z_um: 0, a: 0, b: 0 },
+      mode: 'IMG',
+      sample: { name: 'fcc_single_crystal', registered: true },
+      settings: { ...SESSION.state!.detectors.haadf, field_of_view_um: 0.5 },
+    });
+    render(
+      <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /^Acquire$/i }));
+    await waitFor(() => {
+      const overlay = screen.getByTestId('position-overlay').textContent!;
+      expect(overlay).toContain('(1.234, -0.001) µm'); // 1 nm precision
+      expect(overlay).toContain('FOV: 500 nm');        // nm, not µm
+    });
+  });
+
+  it('disables Live at 4096 (offline-capture window)', () => {
+    const at4096: SessionSnapshot = {
+      ...SESSION,
+      state: {
+        ...SESSION.state!,
+        resolution: { resolution_px: 4096, allowed: [1024, 2048, 4096] },
+      },
+    };
+    render(
+      <MicroscopeControlsPanel session={at4096} sampleRegistered={true} runActive={false} />,
+    );
+    const liveBtn = screen.getByRole('button', { name: /^Live$/i }) as HTMLButtonElement;
+    expect(liveBtn.disabled).toBe(true);
+    expect(liveBtn.title).toMatch(/offline capture/i);
+  });
+
+  it('asks for confirmation before a tilted 4096 acquire', async () => {
+    const tilted4096: SessionSnapshot = {
+      ...SESSION,
+      state: {
+        ...SESSION.state!,
+        stage: { ...SESSION.state!.stage, a: 5, b: 10 },
+        resolution: { resolution_px: 4096, allowed: [1024, 2048, 4096] },
+      },
+    };
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(
+      <MicroscopeControlsPanel session={tilted4096} sampleRegistered={true} runActive={false} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /^Acquire$/i }));
+    expect(confirmSpy).toHaveBeenCalledOnce();
+    expect(twin.acquireImage).not.toHaveBeenCalled(); // declined -> no acquire
+    confirmSpy.mockRestore();
   });
 });

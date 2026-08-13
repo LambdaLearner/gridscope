@@ -73,19 +73,34 @@ export function useCodeExecution(): UseCodeExecutionReturn {
                 addLog('error', event.message);
                 break;
               case 'image': {
-                const meta = event.meta as Record<string, number | string | undefined>;
+                const meta = event.meta as Record<string, unknown>;
                 const src = `data:image/png;base64,${event.image.image_base64}`;
+                // The embedded report_image helper reads the stage back from
+                // the instrument and attaches x_um/y_um/z_um/a_deg/b_deg to
+                // every frame — these are the authoritative acquire-time
+                // coordinates (script-supplied meta keys win over readback).
+                const stage = {
+                  x_um: Number(meta.x_um ?? 0),
+                  y_um: Number(meta.y_um ?? 0),
+                  z_um: Number(meta.z_um ?? 0),
+                  a: meta.a_deg !== undefined ? Number(meta.a_deg) : undefined,
+                  b: meta.b_deg !== undefined ? Number(meta.b_deg) : undefined,
+                };
                 setAcquiredImages((prev) => [
                   ...prev,
                   {
                     image_base64: src,
-                    x_um: Number(meta.x_um ?? 0),
-                    y_um: Number(meta.y_um ?? 0),
+                    x_um: stage.x_um,
+                    y_um: stage.y_um,
+                    z_um: stage.z_um,
+                    a: stage.a,
+                    b: stage.b,
                     label: meta.label !== undefined ? String(meta.label) : undefined,
                   },
                 ]);
                 addLog('image', `Frame received${meta.label ? ` — ${meta.label}` : ''}`, {
                   image_base64: src,
+                  stage,
                 });
                 break;
               }
