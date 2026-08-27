@@ -1,5 +1,12 @@
 # STEM Digital Twin — GUI Build Specification
 
+> **Historical document (v2 era).** The GUI described here has since been
+> built and then migrated to the v5 twin (Aug 2026): abTEM, EELS, beam
+> damage, and the named environment presets described below no longer exist.
+> The authoritative record of the current physics, API surface, and GUI
+> obligations is `Digital_twin_revised_v6/STEM_Digital_Twin_and_GridScope_CHANGELOG.md`.
+> Kept for the rationale behind the original layout decisions.
+
 A build-ready prompt/spec for a two-window GUI on top of the existing STEM digital-twin
 server. Every control below maps to a **real** RPC on `MicroscopeControlClient` (portable
 instrument control) or `SimulationHarness` (twin-only simulation state), so the GUI drives the

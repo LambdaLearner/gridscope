@@ -13,20 +13,21 @@ import {
 import {
   listSamples,
   registerSample,
-  setEnvironment,
   resetSpecimen,
   setThickness,
   setDrift,
-  setSpecimen,
+  setContamination,
+  setNoise,
+  setAutofocusLimits,
   type SampleInfo,
 } from '../api/simulation';
-import { setDetectorSettings, type SessionSnapshot } from '../api/digitalTwin';
+import type { SessionSnapshot } from '../api/digitalTwin';
 import { ApiError } from '../api/client';
 import {
-  CONTAMINATION_MAX_RATE,
-  DAMAGE_MAX_RATE,
-  DRIFT_MAX_JITTER_NM,
-  DRIFT_MAX_NM_PER_S,
+  FALLBACK_LIMITS,
+  fetchLimits,
+  clamp,
+  type ConditionLimits,
 } from '../api/limits';
 import { ParamField } from './controls/ParamField';
 import { SeedField } from './controls/SeedField';
@@ -37,40 +38,6 @@ interface SampleSettingsPanelProps {
   runActive: boolean;
   onRegistered?: () => void;
 }
-
-const ENVIRONMENTS = [
-  {
-    name: 'pristine',
-    description: 'Ideal: no drift, no damage, high dose',
-    sets: 'drift ~0 nm/s (excellent) · damage off · contamination off · dwell 20 µs, DQE 0.9',
-  },
-  {
-    name: 'beam_sensitive',
-    description: 'Damage accumulates; autofocus can fail',
-    sets: 'drift ~0.5 nm/s (good) · damage on (critical dose 1e4 e⁻/Å², rate 0.8) · dwell 10 µs',
-  },
-  {
-    name: 'contaminating',
-    description: 'Carbon builds up where the beam dwells',
-    sets: 'drift ~1.2 nm/s (moderate) · contamination on (rate 3) · dwell 15 µs',
-  },
-  {
-    name: 'thick_drifting',
-    description: 'Strong drift, noisy detector, 90 nm slab',
-    sets: 'drift ~5.8 nm/s (poor) · dwell 6 µs, DQE 0.7 · thickness → 90 nm',
-  },
-  {
-    name: 'low_dose',
-    description: 'Dose-limited: very noisy imaging, 25 nm slab',
-    sets: 'drift ~1.7 nm/s · damage on (5e3, rate 1.0) · dwell 2 µs · thickness → 25 nm',
-  },
-];
-
-/** Format a dose value like 3.0e4 for the log slider read-out. */
-const formatDose = (v: number) => {
-  const exp = Math.floor(Math.log10(v));
-  return `${(v / 10 ** exp).toFixed(1)}e${exp}`;
-};
 
 /** Seed-like params are rendered as SeedField (randomize + visible value). */
 const SEED_LABELS: Record<string, string> = {
@@ -83,11 +50,9 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
   const [samples, setSamples] = useState<SampleInfo[]>([]);
   const [selectedName, setSelectedName] = useState<string>('');
   const [params, setParams] = useState<Record<string, unknown>>({});
-  const [selectedEnv, setSelectedEnv] = useState<string>('pristine');
   const [workingNm, setWorkingNm] = useState(100);
   const [thicknessSeed, setThicknessSeed] = useState(0);
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [showCustomEnv, setShowCustomEnv] = useState(false);
   const [volumeD, setVolumeD] = useState<number | ''>('');
   const [volumeHW, setVolumeHW] = useState<number | ''>('');
   const [isLoadingList, setIsLoadingList] = useState(false);
@@ -95,53 +60,77 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  // Custom environment knobs (apply-on-change; override the preset).
-  // Drift is in PHYSICAL nm/s (excellent <0.2 · good ~0.5 · moderate ~2 · poor ~5).
+  // Bounds for the free-form condition fields. The backend is the single
+  // source of truth (GET /simulation/limits); the fallback covers the gap
+  // before the first fetch (or an offline backend).
+  const [limits, setLimits] = useState<ConditionLimits>(FALLBACK_LIMITS);
+
+  // Acquisition conditions (apply-on-change). There are no presets: what you
+  // set here is exactly what the twin runs with. Drift is in PHYSICAL nm/s
+  // (realistic stage drift is 0.1–5 nm/s; anything above is a mechanical
+  // fault you are choosing to simulate).
   const [driftEnabled, setDriftEnabled] = useState(false);
   const [driftVx, setDriftVx] = useState(0.5);
   const [driftVy, setDriftVy] = useState(0.5);
   const [jitter, setJitter] = useState(0.05);
-  const [damageEnabled, setDamageEnabled] = useState(false);
-  // Critical dose spans six decades (biological ~1-10 ... metals ~1e5-1e7),
-  // so the slider works in log10 space. Default 3e4 = moderately robust.
-  const [doseExp, setDoseExp] = useState(Math.log10(3e4));
-  const [damageRate, setDamageRate] = useState(1.0);
+  const [maxDtS, setMaxDtS] = useState(2);
   const [contamEnabled, setContamEnabled] = useState(false);
-  const [contamRate, setContamRate] = useState(1.0);
+  const [contamRate, setContamRate] = useState(100);
   const [dwellUs, setDwellUs] = useState(20);
+  const [dqe, setDqe] = useState(0.8);
+  const [readoutE, setReadoutE] = useState(1.5);
+  const [doseModel, setDoseModel] = useState(true);
+  const [afMinContrast, setAfMinContrast] = useState(0.08);
 
   const connected = session?.connected ?? false;
   const registeredName = session?.sample?.name ?? null;
-  const currentEnv = session?.state?.environment;
   const thickness = session?.state?.thickness;
   const busy = isRegistering || runActive;
 
-  // Hydrate the custom sliders from the server whenever the environment
-  // changes (presets set drift/specimen server-side; without this the
-  // sliders keep showing stale local values). Also hydrates on first poll.
+  // Fetch the authoritative bounds once per connection.
+  useEffect(() => {
+    if (!connected) return;
+    let cancelled = false;
+    fetchLimits()
+      .then((l) => { if (!cancelled) setLimits(l); })
+      .catch(() => { /* keep the offline fallback */ });
+    return () => { cancelled = true; };
+  }, [connected]);
+
+  // Hydrate the condition widgets from the server on connect and after a
+  // registration (hydrating on every 2 s poll would fight in-progress
+  // slider edits).
   const stateDrift = session?.state?.drift;
   const stateSpecimen = session?.state?.specimen;
+  const stateNoise = session?.state?.detectors?.haadf;
+  const stateAutofocus = session?.state?.autofocus;
   useEffect(() => {
-    if (!stateDrift || !stateSpecimen) return;
-    setDriftEnabled(stateDrift.enabled >= 0.5);
-    setDriftVx(+stateDrift.vx_nm_per_s.toFixed(2));
-    setDriftVy(+stateDrift.vy_nm_per_s.toFixed(2));
-    if (stateDrift.line_jitter_nm !== undefined) {
-      setJitter(+stateDrift.line_jitter_nm.toFixed(2));
+    if (stateDrift) {
+      setDriftEnabled(stateDrift.enabled >= 0.5);
+      setDriftVx(+stateDrift.vx_nm_per_s.toFixed(2));
+      setDriftVy(+stateDrift.vy_nm_per_s.toFixed(2));
+      if (stateDrift.line_jitter_nm !== undefined) {
+        setJitter(+stateDrift.line_jitter_nm.toFixed(2));
+      }
+      if (stateDrift.max_dt_s !== undefined) setMaxDtS(stateDrift.max_dt_s);
     }
-    setDamageEnabled(stateSpecimen.beam_damage_enabled >= 0.5);
-    setDoseExp(Math.log10(Math.max(1, stateSpecimen.damage_dose_threshold)));
-    if (stateSpecimen.damage_rate !== undefined) {
-      setDamageRate(stateSpecimen.damage_rate);
+    if (stateSpecimen) {
+      setContamEnabled(stateSpecimen.contamination_enabled >= 0.5);
+      if (stateSpecimen.contamination_rate !== undefined) {
+        setContamRate(stateSpecimen.contamination_rate);
+      }
     }
-    setContamEnabled(stateSpecimen.contamination_enabled >= 0.5);
-    if (stateSpecimen.contamination_rate !== undefined) {
-      setContamRate(stateSpecimen.contamination_rate);
+    if (stateNoise) {
+      if (stateNoise.dwell_us !== undefined) setDwellUs(stateNoise.dwell_us);
+      if (stateNoise.dqe !== undefined) setDqe(stateNoise.dqe);
+      if (stateNoise.readout_e !== undefined) setReadoutE(stateNoise.readout_e);
+      if (stateNoise.use_dose_model !== undefined) {
+        setDoseModel(stateNoise.use_dose_model >= 0.5);
+      }
     }
-    // Re-run only when the environment changes or the connection appears —
-    // hydrating on every 2 s poll would fight in-progress slider edits.
+    if (stateAutofocus) setAfMinContrast(stateAutofocus.min_contrast);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentEnv, connected]);
+  }, [connected, registeredName]);
 
   const fetchSamples = useCallback(async () => {
     setIsLoadingList(true);
@@ -179,7 +168,6 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
     try {
       const result = await registerSample(selectedName, {
         params,
-        environment: selectedEnv,
         thickness_nm: workingNm,
         thickness_seed: thicknessSeed,
         ...(volumeD !== '' ? { D: Number(volumeD) } : {}),
@@ -187,8 +175,7 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
       });
       const th = result.thickness;
       setNotice(
-        `Registered '${result.registered}' (${result.shape.join('×')}) — fresh specimen, ` +
-        `environment '${result.environment ?? 'unchanged'}'` +
+        `Registered '${result.registered}' (${result.shape.join('×')}) — fresh specimen` +
         (th
           ? `; images a ${th.working_nm.toFixed(0)} nm slab starting ` +
             `${th.z_start_nm.toFixed(1)} nm into the ${th.total_nm.toFixed(0)} nm specimen`
@@ -199,19 +186,6 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
       reportError(e, 'Registration failed');
     } finally {
       setIsRegistering(false);
-    }
-  };
-
-  const handleEnvironmentChange = async (name: string) => {
-    setSelectedEnv(name);
-    if (!registeredName) return; // applied on register
-    setError(null);
-    try {
-      await setEnvironment(name);
-      setNotice(`Environment set to '${name}'`);
-      onRegistered?.();
-    } catch (e) {
-      reportError(e, 'Failed to set environment');
     }
   };
 
@@ -240,15 +214,20 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
     }
   };
 
-  // Custom environment: apply-on-change (overrides the preset). Drift goes
-  // through the physical nm/s interface; the server echoes the applied rate.
-  const applyDrift = async (patch: Partial<{ enabled: boolean; vx: number; vy: number; jitter: number }>) => {
+  // Apply-on-change condition setters. Every value is clamped against the
+  // server-published bounds before the RPC: the widgets already enforce the
+  // range, but a pasted or programmatic value must not bypass it (the twin
+  // server itself accepts nearly anything).
+  const applyDrift = async (
+    patch: Partial<{ enabled: boolean; vx: number; vy: number; jitter: number; maxDt: number }>,
+  ) => {
     try {
       const r = await setDrift({
         enabled: patch.enabled ?? driftEnabled,
-        vx_nm_per_s: patch.vx ?? driftVx,
-        vy_nm_per_s: patch.vy ?? driftVy,
-        line_jitter_nm: patch.jitter ?? jitter,
+        vx_nm_per_s: clamp(patch.vx ?? driftVx, limits.drift.vx_nm_per_s),
+        vy_nm_per_s: clamp(patch.vy ?? driftVy, limits.drift.vy_nm_per_s),
+        line_jitter_nm: clamp(patch.jitter ?? jitter, limits.drift.line_jitter_nm),
+        max_dt_s: clamp(patch.maxDt ?? maxDtS, limits.drift.max_dt_s),
       });
       setNotice(
         `Drift set: ${r.drift.vx_nm_per_s.toFixed(2)}, ${r.drift.vy_nm_per_s.toFixed(2)} nm/s`,
@@ -258,27 +237,42 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
     }
   };
 
-  const applySpecimen = async (patch: Record<string, unknown>) => {
+  const applyContamination = async (patch: Partial<{ enabled: boolean; rate: number }>) => {
     try {
-      await setSpecimen({
-        beam_damage_enabled: (patch.beam_damage_enabled as boolean) ?? damageEnabled,
-        damage_dose_threshold: (patch.damage_dose_threshold as number) ?? 10 ** doseExp,
-        damage_rate: (patch.damage_rate as number) ?? damageRate,
-        contamination_enabled: (patch.contamination_enabled as boolean) ?? contamEnabled,
-        contamination_rate: (patch.contamination_rate as number) ?? contamRate,
+      const r = await setContamination({
+        enabled: patch.enabled ?? contamEnabled,
+        rate: clamp(patch.rate ?? contamRate, limits.contamination.rate),
       });
-      setNotice('Custom specimen settings applied');
+      setNotice(`Contamination: ${r.contamination_enabled >= 0.5 ? 'on' : 'off'}, rate ${r.contamination_rate.toFixed(0)}% of nominal`);
     } catch (e) {
-      reportError(e, 'Failed to set specimen');
+      reportError(e, 'Failed to set contamination');
     }
   };
 
-  const applyDwell = async (us: number) => {
+  const applyNoise = async (
+    patch: Partial<{ dwell: number; dqe: number; readout: number; doseModel: boolean }>,
+  ) => {
     try {
-      await setDetectorSettings('haadf', { dwell_us: us });
-      setNotice(`Dwell time set to ${us} µs`);
+      await setNoise({
+        dwell_us: clamp(patch.dwell ?? dwellUs, limits.noise.dwell_us),
+        dqe: clamp(patch.dqe ?? dqe, limits.noise.dqe),
+        readout_e: clamp(patch.readout ?? readoutE, limits.noise.readout_e),
+        use_dose_model: patch.doseModel ?? doseModel,
+      });
+      setNotice('Detector noise settings applied');
     } catch (e) {
-      reportError(e, 'Failed to set dwell time');
+      reportError(e, 'Failed to set noise');
+    }
+  };
+
+  const applyAutofocusLimits = async (minContrast: number) => {
+    try {
+      const r = await setAutofocusLimits({
+        min_contrast: clamp(minContrast, limits.autofocus.min_contrast),
+      });
+      setNotice(`Autofocus min contrast set to ${r.af_min_contrast.toFixed(2)}`);
+    } catch (e) {
+      reportError(e, 'Failed to set autofocus limits');
     }
   };
 
@@ -292,7 +286,7 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
       <div className="flex items-center justify-between px-4 py-3 bg-slate-800 border-b border-slate-700">
         <div className="flex items-center gap-2">
           <FlaskConical className="w-5 h-5 text-amber-400" />
-          <span className="font-semibold text-white">Sample Registration &amp; Environment</span>
+          <span className="font-semibold text-white">Sample Registration &amp; Conditions</span>
           <span className="text-[10px] text-slate-500 uppercase tracking-wider bg-slate-700 px-1.5 py-0.5 rounded">
             simulation only
           </span>
@@ -315,7 +309,6 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
               <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
               <span>
                 Registered: <span className="font-mono">{registeredName}</span>
-                {currentEnv && <> · environment <span className="font-mono">{currentEnv}</span></>}
               </span>
             </div>
           ) : (
@@ -458,166 +451,148 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
           </div>
         </div>
 
-        {/* ===== Right column: environment ===== */}
+        {/* ===== Right column: acquisition conditions ===== */}
         <div className="space-y-4">
-          <div className="space-y-2">
+          <div className="space-y-1">
             <label className="text-sm text-slate-400 flex items-center gap-1">
               <CloudFog className="w-4 h-4" />
-              Simulation environment (preset)
+              Acquisition conditions
             </label>
-            <select
-              value={selectedEnv}
-              onChange={(e) => handleEnvironmentChange(e.target.value)}
-              disabled={!connected || busy}
-              className="w-full bg-slate-700 text-white text-sm rounded-lg px-3 py-2 border border-slate-600 focus:ring-1 focus:ring-amber-500 disabled:opacity-50"
-            >
-              {ENVIRONMENTS.map((env) => (
-                <option key={env.name} value={env.name}>{env.name}</option>
-              ))}
-            </select>
-            <p className="text-xs text-slate-500">
-              {ENVIRONMENTS.find((e) => e.name === selectedEnv)?.description}
-            </p>
-            <p className="text-[10px] text-slate-600 font-mono leading-relaxed">
-              sets: {ENVIRONMENTS.find((e) => e.name === selectedEnv)?.sets}
+            <p className="text-xs text-slate-500 leading-relaxed">
+              No presets: the values below are exactly what the twin runs
+              with. They apply on change and are independent of sample
+              registration.
             </p>
           </div>
 
-          {/* Custom / expert controls (override the preset, apply on change) */}
-          <div className="space-y-2">
-            <button
-              onClick={() => setShowCustomEnv((v) => !v)}
-              className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-300"
-            >
-              {showCustomEnv ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-              Custom / expert controls (override preset)
-            </button>
+          <div className="space-y-4">
+            {/* Drift */}
+            <div className="space-y-2 bg-slate-800/50 rounded-lg p-3">
+              <label className="flex items-center gap-2 text-xs text-slate-300 font-medium">
+                <input
+                  type="checkbox"
+                  checked={driftEnabled}
+                  onChange={(e) => { setDriftEnabled(e.target.checked); applyDrift({ enabled: e.target.checked }); }}
+                  disabled={!connected || busy}
+                  className="accent-amber-500"
+                />
+                Mechanical drift
+              </label>
+              {/* Visibility depends on FOV: 1 px ≈ FOV/1024, so at a 20 µm
+                  field even 10 nm/s moves <1 px per frame. Watch drift in
+                  Live mode at ≤1 µm FOV, or raise the rate. */}
+              <ScaledSlider
+                label="Drift vx" value={driftVx} min={limits.drift.vx_nm_per_s.min} max={limits.drift.vx_nm_per_s.max} step={0.1} unit="nm/s"
+                scaleLabels={['excellent', 'good', 'moderate', 'poor']}
+                onCommit={(v) => { setDriftVx(v); applyDrift({ vx: v }); }}
+                disabled={!connected || busy || !driftEnabled}
+              />
+              <ScaledSlider
+                label="Drift vy" value={driftVy} min={limits.drift.vy_nm_per_s.min} max={limits.drift.vy_nm_per_s.max} step={0.1} unit="nm/s"
+                scaleLabels={['excellent', 'good', 'moderate', 'poor']}
+                onCommit={(v) => { setDriftVy(v); applyDrift({ vy: v }); }}
+                disabled={!connected || busy || !driftEnabled}
+              />
+              <ScaledSlider
+                label="Line jitter" value={jitter} min={limits.drift.line_jitter_nm.min} max={limits.drift.line_jitter_nm.max} step={0.05} unit="nm"
+                onCommit={(v) => { setJitter(v); applyDrift({ jitter: v }); }}
+                disabled={!connected || busy || !driftEnabled}
+              />
+              <ScaledSlider
+                label="Idle-time cap (drift accrual per frame)" value={maxDtS} min={limits.drift.max_dt_s.min} max={limits.drift.max_dt_s.max} step={1} unit="s"
+                onCommit={(v) => { setMaxDtS(v); applyDrift({ maxDt: v }); }}
+                disabled={!connected || busy || !driftEnabled}
+              />
+              <p className="text-[10px] text-slate-500 leading-snug">
+                Drift shows as frame-to-frame motion: use Live mode at a small
+                FOV (≤1 µm) — at wide fields one pixel spans tens of nm, so
+                even fast drift looks static. The idle-time cap keeps a long
+                pause from teleporting the field; raise it to let a deliberate
+                wait accumulate.
+              </p>
+              <button
+                onClick={() => setDrift({ reset_accum: true }).then(() => setNotice('Drift accumulation reset (view re-centred)')).catch((e) => reportError(e, 'Failed to reset drift'))}
+                disabled={!connected || busy}
+                className="text-[10px] text-slate-400 hover:text-white underline disabled:opacity-50"
+              >
+                Reset accumulated drift (re-centre view)
+              </button>
+            </div>
 
-            {showCustomEnv && (
-              <div className="space-y-4 pl-1">
-                {/* Drift */}
-                <div className="space-y-2 bg-slate-800/50 rounded-lg p-3">
-                  <label className="flex items-center gap-2 text-xs text-slate-300 font-medium">
-                    <input
-                      type="checkbox"
-                      checked={driftEnabled}
-                      onChange={(e) => { setDriftEnabled(e.target.checked); applyDrift({ enabled: e.target.checked }); }}
-                      disabled={!connected || busy}
-                      className="accent-amber-500"
-                    />
-                    Mechanical drift
-                  </label>
-                  {/* Visibility depends on FOV: 1 px ≈ FOV/1024, so at a 20 µm
-                      field even 10 nm/s moves <1 px per frame. Watch drift in
-                      Live mode at ≤1 µm FOV, or raise the rate. */}
-                  <ScaledSlider
-                    label="Drift vx" value={driftVx} min={0} max={DRIFT_MAX_NM_PER_S} step={0.1} unit="nm/s"
-                    scaleLabels={['excellent', 'good', 'moderate', 'poor']}
-                    onCommit={(v) => { setDriftVx(v); applyDrift({ vx: v }); }}
-                    disabled={!connected || busy || !driftEnabled}
-                  />
-                  <ScaledSlider
-                    label="Drift vy" value={driftVy} min={0} max={DRIFT_MAX_NM_PER_S} step={0.1} unit="nm/s"
-                    scaleLabels={['excellent', 'good', 'moderate', 'poor']}
-                    onCommit={(v) => { setDriftVy(v); applyDrift({ vy: v }); }}
-                    disabled={!connected || busy || !driftEnabled}
-                  />
-                  <ScaledSlider
-                    label="Line jitter" value={jitter} min={0} max={DRIFT_MAX_JITTER_NM} step={0.05} unit="nm"
-                    onCommit={(v) => { setJitter(v); applyDrift({ jitter: v }); }}
-                    disabled={!connected || busy || !driftEnabled}
-                  />
-                  <p className="text-[10px] text-slate-500 leading-snug">
-                    Drift shows as frame-to-frame motion: use Live mode at a small
-                    FOV (≤1 µm) — at wide fields one pixel spans tens of nm, so
-                    even fast drift looks static.
-                  </p>
-                  <button
-                    onClick={() => setDrift({ reset_accum: true }).then(() => setNotice('Drift accumulation reset (view re-centred)')).catch((e) => reportError(e, 'Failed to reset drift'))}
-                    disabled={!connected || busy}
-                    className="text-[10px] text-slate-400 hover:text-white underline disabled:opacity-50"
-                  >
-                    Reset accumulated drift (re-centre view)
-                  </button>
-                </div>
+            {/* Contamination */}
+            <div className="space-y-2 bg-slate-800/50 rounded-lg p-3">
+              <label className="flex items-center gap-2 text-xs text-slate-300 font-medium">
+                <input
+                  type="checkbox"
+                  checked={contamEnabled}
+                  onChange={(e) => { setContamEnabled(e.target.checked); applyContamination({ enabled: e.target.checked }); }}
+                  disabled={!connected || busy}
+                  className="accent-amber-500"
+                />
+                Contamination
+              </label>
+              <ScaledSlider
+                label="Rate (% of nominal; 100 = calibrated rate)" value={contamRate} min={limits.contamination.rate.min} max={limits.contamination.rate.max} step={10} unit="%"
+                scaleLabels={['off', 'nominal', 'fast']}
+                onCommit={(v) => { setContamRate(v); applyContamination({ rate: v }); }}
+                disabled={!connected || busy || !contamEnabled}
+              />
+              <p className="text-[10px] text-slate-500 leading-snug">
+                Contamination builds where the beam dwells: it needs repeated
+                frames over the same spot (Live mode at high magnification)
+                and grows fastest with high current and long dwell.
+              </p>
+            </div>
 
-                {/* Beam damage */}
-                <div className="space-y-2 bg-slate-800/50 rounded-lg p-3">
-                  <label className="flex items-center gap-2 text-xs text-slate-300 font-medium">
-                    <input
-                      type="checkbox"
-                      checked={damageEnabled}
-                      onChange={(e) => { setDamageEnabled(e.target.checked); applySpecimen({ beam_damage_enabled: e.target.checked }); }}
-                      disabled={!connected || busy}
-                      className="accent-amber-500"
-                    />
-                    Beam damage
-                  </label>
-                  {/* Critical dose spans six decades -> log slider (spec A5) */}
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-slate-400">Critical dose</span>
-                      <span className="text-white font-mono bg-slate-700 px-2 py-0.5 rounded">
-                        {formatDose(10 ** doseExp)} e⁻/Å²
-                      </span>
-                    </div>
-                    <input
-                      type="range" min={2} max={6} step={0.05} value={doseExp}
-                      onChange={(e) => setDoseExp(Number(e.target.value))}
-                      onMouseUp={() => applySpecimen({ damage_dose_threshold: 10 ** doseExp })}
-                      onTouchEnd={() => applySpecimen({ damage_dose_threshold: 10 ** doseExp })}
-                      disabled={!connected || busy || !damageEnabled}
-                      aria-label="Critical dose"
-                      className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-amber-500 disabled:opacity-50"
-                    />
-                    <div className="flex justify-between text-[10px] text-slate-600">
-                      <span>zeolite/MOF</span><span>oxides</span><span>metals</span>
-                    </div>
-                  </div>
-                  <ScaledSlider
-                    label="Damage rate" value={damageRate} min={0} max={DAMAGE_MAX_RATE} step={0.05}
-                    onCommit={(v) => { setDamageRate(v); applySpecimen({ damage_rate: v }); }}
-                    disabled={!connected || busy || !damageEnabled}
-                  />
-                </div>
+            {/* Detector noise / dose */}
+            <div className="space-y-2 bg-slate-800/50 rounded-lg p-3">
+              <div className="text-xs text-slate-300 font-medium">Detector noise &amp; dose</div>
+              {/* Deliberate practical subrange of the served bound (0.1–1000):
+                  1–100 µs is where real dwell lives; the clamp still allows a
+                  blob/script to use the full served range. */}
+              <ScaledSlider
+                label="Dwell time (lower = noisier)" value={dwellUs} min={1} max={100} step={1} unit="µs"
+                scaleLabels={['noisy', '', 'clean']}
+                onCommit={(v) => { setDwellUs(v); applyNoise({ dwell: v }); }}
+                disabled={!connected || busy}
+              />
+              <ScaledSlider
+                label="DQE (detector quantum efficiency)" value={dqe} min={limits.noise.dqe.min} max={limits.noise.dqe.max} step={0.01}
+                onCommit={(v) => { setDqe(v); applyNoise({ dqe: v }); }}
+                disabled={!connected || busy}
+              />
+              <ScaledSlider
+                label="Readout noise" value={readoutE} min={limits.noise.readout_e.min} max={10} step={0.1} unit="e⁻"
+                onCommit={(v) => { setReadoutE(v); applyNoise({ readout: v }); }}
+                disabled={!connected || busy}
+              />
+              <label className="flex items-center gap-2 text-xs text-slate-400">
+                <input
+                  type="checkbox"
+                  checked={doseModel}
+                  onChange={(e) => { setDoseModel(e.target.checked); applyNoise({ doseModel: e.target.checked }); }}
+                  disabled={!connected || busy}
+                  className="accent-amber-500"
+                />
+                Poisson dose model (off = legacy gaussian noise)
+              </label>
+            </div>
 
-                {/* Contamination */}
-                <div className="space-y-2 bg-slate-800/50 rounded-lg p-3">
-                  <label className="flex items-center gap-2 text-xs text-slate-300 font-medium">
-                    <input
-                      type="checkbox"
-                      checked={contamEnabled}
-                      onChange={(e) => { setContamEnabled(e.target.checked); applySpecimen({ contamination_enabled: e.target.checked }); }}
-                      disabled={!connected || busy}
-                      className="accent-amber-500"
-                    />
-                    Contamination
-                  </label>
-                  <ScaledSlider
-                    label="Contamination rate" value={contamRate} min={0} max={CONTAMINATION_MAX_RATE} step={0.1}
-                    scaleLabels={['none', 'mild', 'heavy']}
-                    onCommit={(v) => { setContamRate(v); applySpecimen({ contamination_rate: v }); }}
-                    disabled={!connected || busy || !contamEnabled}
-                  />
-                  <p className="text-[10px] text-slate-500 leading-snug">
-                    Contamination builds where the beam dwells: it needs repeated
-                    frames over the same spot (Live mode at high magnification)
-                    and grows fastest with high current and long dwell.
-                  </p>
-                </div>
-
-                {/* Detector dose */}
-                <div className="space-y-2 bg-slate-800/50 rounded-lg p-3">
-                  <div className="text-xs text-slate-300 font-medium">Detector dose</div>
-                  <ScaledSlider
-                    label="Dwell time (lower = noisier)" value={dwellUs} min={1} max={100} step={1} unit="µs"
-                    scaleLabels={['noisy', '', 'clean']}
-                    onCommit={(v) => { setDwellUs(v); applyDwell(v); }}
-                    disabled={!connected || busy}
-                  />
-                </div>
-              </div>
-            )}
+            {/* Autofocus acceptance */}
+            <div className="space-y-2 bg-slate-800/50 rounded-lg p-3">
+              <div className="text-xs text-slate-300 font-medium">Autofocus</div>
+              <ScaledSlider
+                label="Min contrast for convergence (higher = stricter)"
+                value={afMinContrast} min={limits.autofocus.min_contrast.min} max={limits.autofocus.min_contrast.max} step={0.01}
+                onCommit={(v) => { setAfMinContrast(v); applyAutofocusLimits(v); }}
+                disabled={!connected || busy}
+              />
+              <p className="text-[10px] text-slate-500 leading-snug">
+                Autofocus reports non-convergence when its sharpness curve's
+                peak/floor ratio falls below this — raise it to make focus
+                failure easier to trigger in workflow tests.
+              </p>
+            </div>
           </div>
 
           {/* Register + reset */}
@@ -644,7 +619,7 @@ export function SampleSettingsPanel({ session, runActive, onRegistered }: Sample
                 onClick={handleResetSpecimen}
                 disabled={!connected || busy}
                 className="flex items-center gap-1 px-3 py-2.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-slate-300 rounded-lg transition-colors text-xs"
-                title="Clear accumulated beam damage and contamination"
+                title="Clear accumulated contamination"
               >
                 <RotateCcw className="w-3 h-3" />
                 Fresh specimen

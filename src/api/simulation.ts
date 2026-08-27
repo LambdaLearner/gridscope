@@ -2,8 +2,13 @@
  * API client for the SIMULATION surface (/api/simulation).
  *
  * Twin-only configuration with no real-instrument counterpart: the sample
- * registry and registration, simulation environments, specimen degradation,
- * and drift injection. Only the Sample Settings window uses this module.
+ * registry and registration, acquisition conditions (drift, contamination,
+ * detector noise, autofocus limits), and specimen reset. Only the Sample
+ * Settings window uses this module.
+ *
+ * There are no environment presets: conditions are explicit numbers, set
+ * through the individual setters below and bounded by GET /simulation/limits
+ * (see api/limits.ts).
  */
 
 import { apiGet, apiPost } from './client';
@@ -47,12 +52,10 @@ export interface RegisterResult {
   shape: number[];
   params: Record<string, unknown>;
   thickness: ThicknessInfo | null;
-  environment: string | null;
 }
 
 export interface RegisterOptions {
   params?: Record<string, unknown>;
-  environment?: string;
   D?: number;
   H?: number;
   W?: number;
@@ -60,43 +63,11 @@ export interface RegisterOptions {
   thickness_seed?: number;
 }
 
-export interface AbtemAvailability {
-  available: boolean;
-  detail: string | null;
-}
-
-export interface AbtemResult {
-  success: boolean;
-  engine: 'abtem';
-  image: { image_base64: string; width: number; height: number; dtype: string };
-  state: {
-    sample: string;
-    params: Record<string, unknown>;
-    tilt_a_deg: number;
-    tilt_b_deg: number;
-    energy_kev: number;
-    num_frozen_phonons: number;
-  };
-  fingerprint: string;
-  n_atoms: number;
-  compute_seconds: number;
-  cached: boolean;
-}
-
-export interface EnvironmentInfo {
-  environment: string;
-  available: string[];
-}
-
 export interface SpecimenState {
-  beam_damage_enabled: number;
-  damage_dose_threshold: number;
-  damage_rate: number;
   contamination_enabled: number;
+  /** Percentage of the calibrated nominal rate: 100 = nominal, 0 = off. */
   contamination_rate: number;
-  max_accumulated_dose?: number;
   max_contamination?: number;
-  [key: string]: number | undefined;
 }
 
 export interface DriftState {
@@ -106,6 +77,15 @@ export interface DriftState {
   accum_y_px: number;
   line_jitter_px: number;
   enabled: number;
+  max_dt_s: number;
+}
+
+export interface NoiseState {
+  dwell_us: number;
+  dqe: number;
+  readout_e: number;
+  use_dose_model: number;
+  noise_sigma: number;
 }
 
 // ===== Endpoints =====
@@ -120,7 +100,10 @@ export function getCurrentSample(): Promise<{ sample: CurrentSample; registered:
 
 /**
  * Register a sample: it becomes the active specimen (degradation history is
- * reset). Building the volume takes a few seconds for large samples.
+ * reset). Building the volume takes a few seconds for large samples — and
+ * the FIRST load of a shape_assembly parameter set also runs a one-off
+ * density calibration. Acquisition conditions are independent of
+ * registration and unchanged by it.
  */
 export function registerSample(
   name: string,
@@ -145,41 +128,36 @@ export function setThickness(settings: {
   return apiPost('/simulation/thickness', settings);
 }
 
-export function getAbtemAvailability(): Promise<AbtemAvailability> {
-  return apiGet('/simulation/diffraction/abtem/availability');
-}
-
-/**
- * Compute a dynamical (abTEM multislice) SAED pattern for the registered
- * sample at the current stage tilt. Long-running (seconds to tens of
- * seconds); 409 while another computation runs; 501 if abtem not installed.
- */
-export function computeAbtemDiffraction(options: {
-  num_frozen_phonons?: number;
-} = {}): Promise<AbtemResult> {
-  return apiPost('/simulation/diffraction/abtem', options);
-}
-
-export function setSpecimen(settings: {
-  beam_damage_enabled?: boolean;
-  damage_dose_threshold?: number;
-  damage_rate?: number;
-  contamination_enabled?: boolean;
-  contamination_rate?: number;
-}): Promise<{ success: boolean } & SpecimenState> {
-  return apiPost('/simulation/specimen', settings);
-}
-
-export function getEnvironment(): Promise<EnvironmentInfo> {
-  return apiGet('/simulation/environment');
-}
-
-export function setEnvironment(name: string): Promise<{ success: boolean; environment: string }> {
-  return apiPost('/simulation/environment', { name });
-}
-
 export function getSpecimen(): Promise<SpecimenState> {
   return apiGet('/simulation/specimen');
+}
+
+/** Contamination: carbon accumulating where the beam dwells.
+ *  `rate` is a percentage — 100 = nominal, 200 = twice as fast, 0 = off. */
+export function setContamination(settings: {
+  enabled?: boolean;
+  rate?: number;
+}): Promise<{ success: boolean } & SpecimenState> {
+  return apiPost('/simulation/contamination', settings);
+}
+
+/** Detector / dose noise. Writes ONLY the keys passed — an omitted key
+ *  keeps its current server-side value. */
+export function setNoise(settings: {
+  dwell_us?: number;
+  dqe?: number;
+  readout_e?: number;
+  use_dose_model?: boolean;
+  noise_sigma?: number;
+}): Promise<{ success: boolean } & NoiseState> {
+  return apiPost('/simulation/noise', settings);
+}
+
+/** Peak/floor contrast ratio below which autofocus reports non-convergence. */
+export function setAutofocusLimits(settings: {
+  min_contrast?: number;
+}): Promise<{ success: boolean; af_min_contrast: number }> {
+  return apiPost('/simulation/autofocus-limits', settings);
 }
 
 export function resetSpecimen(): Promise<{ success: boolean; reset: boolean }> {
@@ -191,7 +169,7 @@ export function getDrift(): Promise<DriftState> {
 }
 
 export function setDrift(settings: {
-  /** Physical interface (preferred): TEM-realistic drift is 0–10 nm/s. */
+  /** Physical interface (preferred): realistic stage drift is 0.1–5 nm/s. */
   vx_nm_per_s?: number;
   vy_nm_per_s?: number;
   line_jitter_nm?: number;
@@ -199,6 +177,9 @@ export function setDrift(settings: {
   vx_px_per_s?: number;
   vy_px_per_s?: number;
   line_jitter_px?: number;
+  /** Per-frame elapsed-time cap (idle-jump guard); raise for a deliberate
+   *  long-gap drift study. */
+  max_dt_s?: number;
   enabled?: boolean;
   reset_accum?: boolean;
 }): Promise<{ success: boolean; drift: DriftState & { vx_nm_per_s: number; vy_nm_per_s: number } }> {

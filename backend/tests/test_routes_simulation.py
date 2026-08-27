@@ -1,6 +1,7 @@
 """Route tests for the SIMULATION surface (sample registry / registration,
-environments, specimen, drift) plus an end-to-end pass against a real
-in-process STEMServer to catch stub drift."""
+acquisition conditions: contamination / noise / drift / autofocus limits)
+plus an end-to-end pass against a real in-process STEMServer to catch stub
+drift."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,8 +14,9 @@ from app.services import twin_session as ts
 class FakeHarness:
     def __init__(self):
         self.loaded = None
-        self.environment = "pristine"
         self.reset_called = 0
+        self.contamination_calls = []
+        self.noise_calls = []
         self.thickness = {"total_nm": 100.0, "working_nm": 100.0,
                           "z_start_nm": 0.0, "seed": 0}
 
@@ -53,20 +55,19 @@ class FakeHarness:
         self.reset_called += 1
         return {"reset": True}
 
-    def set_environment(self, name):
-        if name == "no_such_env":
-            raise RuntimeError(f"Server error: Unknown environment '{name}'.")
-        self.environment = name
-        return {"environment": name, "config": {}}
-
-    def get_environment(self):
-        return {"environment": self.environment, "available": ["pristine"]}
-
     def get_specimen(self):
-        return {"beam_damage_enabled": 0.0}
+        return {"contamination_enabled": 0.0, "contamination_rate": 100.0,
+                "max_contamination": 0.0}
 
-    def set_specimen(self, **kw):
-        return {"beam_damage_enabled": 1.0}
+    def set_contamination(self, enabled=None, rate=None):
+        self.contamination_calls.append({"enabled": enabled, "rate": rate})
+        return {"contamination_enabled": 1.0 if enabled else 0.0,
+                "contamination_rate": 100.0 if rate is None else float(rate),
+                "max_contamination": 0.0}
+
+    def set_noise(self, **kw):
+        self.noise_calls.append(kw)
+        return dict(kw)
 
     def get_drift(self):
         return {"enabled": 0.0}
@@ -100,22 +101,23 @@ class TestRegistry:
 
 
 class TestRegistration:
-    def test_register_loads_resets_and_sets_environment(self, client, harness):
+    def test_register_loads_and_resets(self, client, harness):
+        r = client.post("/api/simulation/sample/register",
+                        json={"name": "fcc_single_crystal"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["registered"] == "fcc_single_crystal"
+        assert harness.loaded == "fcc_single_crystal"
+        assert harness.reset_called == 1, "registration must reset degradation"
+
+    def test_register_ignores_stray_environment_field(self, client, harness):
+        # pydantic drops unknown fields by default; a stale v4 client sending
+        # "environment" must not break registration or echo back.
         r = client.post("/api/simulation/sample/register",
                         json={"name": "fcc_single_crystal",
                               "environment": "pristine"})
         assert r.status_code == 200
-        body = r.json()
-        assert body["registered"] == "fcc_single_crystal"
-        assert body["environment"] == "pristine"
-        assert harness.loaded == "fcc_single_crystal"
-        assert harness.reset_called == 1, "registration must reset degradation"
-
-    def test_register_without_environment_keeps_current(self, client, harness):
-        r = client.post("/api/simulation/sample/register",
-                        json={"name": "fcc_single_crystal"})
-        assert r.status_code == 200
-        assert r.json()["environment"] is None
+        assert "environment" not in r.json()
 
     def test_register_unknown_sample_is_404(self, client):
         r = client.post("/api/simulation/sample/register", json={"name": "no_such"})
@@ -132,16 +134,53 @@ class TestRegistration:
             ts.end_run()
 
 
-class TestEnvironment:
-    def test_set_environment(self, client, harness):
-        r = client.post("/api/simulation/environment", json={"name": "pristine"})
-        assert r.status_code == 200
-        assert harness.environment == "pristine"
+class TestLimits:
+    def test_limits_payload_matches_limits_module(self, client):
+        from app.digital_twin import limits
 
-    def test_unknown_environment_is_400(self, client):
-        r = client.post("/api/simulation/environment", json={"name": "no_such_env"})
-        assert r.status_code == 400
-        assert "Unknown environment" in r.json()["detail"]
+        r = client.get("/api/simulation/limits")
+        assert r.status_code == 200
+        body = r.json()
+        assert body == limits.as_dict()
+        assert body["drift"]["vx_nm_per_s"]["max"] == 50
+        assert body["contamination"]["rate"]["max"] == 1000
+
+
+class TestConditionEndpoints:
+    def test_set_contamination_passes_args(self, client, harness):
+        r = client.post("/api/simulation/contamination",
+                        json={"enabled": True, "rate": 250.0})
+        assert r.status_code == 200
+        assert harness.contamination_calls == [{"enabled": True, "rate": 250.0}]
+
+    def test_set_noise_passes_only_provided_keys(self, client, harness):
+        # An omitted key must not be forwarded (the twin keeps its current
+        # value); forwarding None-as-default here is how settings leak.
+        r = client.post("/api/simulation/noise", json={"dwell_us": 5.0})
+        assert r.status_code == 200
+        assert harness.noise_calls == [{"dwell_us": 5.0}]
+
+    @pytest.mark.parametrize("path,payload", [
+        ("/api/simulation/contamination", {"rate": 2000.0}),
+        ("/api/simulation/noise", {"dwell_us": 0.0}),
+        ("/api/simulation/drift", {"vx_nm_per_s": 1e6}),
+        ("/api/simulation/drift", {"max_dt_s": 99999.0}),
+        ("/api/simulation/autofocus-limits", {"min_contrast": 2.0}),
+    ])
+    def test_out_of_bounds_condition_is_422(self, client, path, payload):
+        assert client.post(path, json=payload).status_code == 422
+
+
+class TestRemovedEnvironmentRoutes:
+    def test_environment_routes_are_gone(self, client):
+        assert client.post("/api/simulation/environment",
+                           json={"name": "pristine"}).status_code in (404, 405)
+        assert client.get("/api/simulation/environment").status_code in (404, 405)
+
+    def test_specimen_post_route_is_gone(self, client):
+        r = client.post("/api/simulation/specimen",
+                        json={"contamination_rate": 20.0})
+        assert r.status_code in (404, 405)
 
 
 class TestThicknessRoutes:
@@ -261,8 +300,7 @@ class TestEndToEnd:
 
         # Register
         r = e2e_client.post("/api/simulation/sample/register",
-                            json={"name": "au_dispersed",
-                                  "environment": "pristine"})
+                            json={"name": "au_dispersed"})
         assert r.status_code == 200
 
         # Acquire now works and returns a PNG payload
@@ -298,7 +336,7 @@ class TestEndToEnd:
                             json={"name": "atomsk_polycrystal"})
         assert r.status_code == 200
 
-    def test_thickness_resolution_and_spectrum_flow(self, e2e_client):
+    def test_thickness_and_resolution_flow(self, e2e_client):
         # Register with an explicit working thickness + seed
         r = e2e_client.post("/api/simulation/sample/register",
                             json={"name": "fcc_single_crystal",
@@ -327,25 +365,24 @@ class TestEndToEnd:
         assert r.status_code == 422  # not a legal window
         e2e_client.post("/api/microscope/resolution", json={"resolution_px": 1024})
 
-        # EELS spectrum shows the Fe-L edge for the Fe crystal
-        r = e2e_client.post("/api/microscope/spectrum",
-                            json={"ev_min": 0.0, "ev_max": 1000.0,
-                                  "n_channels": 256})
+    def test_autofocus_limits_reach_the_control_client(self, e2e_client):
+        # This route goes through ts.get_control(), not the harness.
+        r = e2e_client.post("/api/simulation/autofocus-limits",
+                            json={"min_contrast": 0.3})
         assert r.status_code == 200
-        body = r.json()
-        assert len(body["energy_ev"]) == 256
-        assert "Fe-L" in [e["label"] for e in body["edges"]]
+        assert r.json()["af_min_contrast"] == pytest.approx(0.3)
 
 
 class TestDriftSpecimenBounds:
-    """Drift/specimen limits are enforced at the HTTP boundary (7A): scripts
+    """Drift/condition limits are enforced at the HTTP boundary (7A): scripts
     hit this surface too, so out-of-range values must 422, not render garbage.
     Bounds come from app.digital_twin.limits — one Python source of truth."""
 
     def test_drift_within_bounds_ok(self, client, harness):
         r = client.post("/api/simulation/drift",
                         json={"enabled": True, "vx_nm_per_s": 50.0,
-                              "vy_nm_per_s": 0.0, "line_jitter_nm": 5.0})
+                              "vy_nm_per_s": 0.0, "line_jitter_nm": 5.0,
+                              "max_dt_s": 120.0})
         assert r.status_code == 200
 
     @pytest.mark.parametrize("payload", [
@@ -355,39 +392,24 @@ class TestDriftSpecimenBounds:
         {"line_jitter_nm": 5.1},
         {"vx_px_per_s": 51.0},
         {"line_jitter_px": 6.0},
+        {"max_dt_s": -1.0},
     ])
     def test_drift_out_of_bounds_is_422(self, client, payload):
         r = client.post("/api/simulation/drift", json=payload)
         assert r.status_code == 422
 
-    def test_specimen_within_bounds_ok(self, client):
-        r = client.post("/api/simulation/specimen",
-                        json={"contamination_enabled": True,
-                              "contamination_rate": 20.0,
-                              "damage_rate": 10.0,
-                              "damage_dose_threshold": 3e4})
-        assert r.status_code == 200
-
-    @pytest.mark.parametrize("payload", [
-        {"contamination_rate": 20.1},
-        {"contamination_rate": -1.0},
-        {"damage_rate": 10.5},
-        {"damage_dose_threshold": 0.0},
-        {"damage_dose_threshold": 1e9},
-    ])
-    def test_specimen_out_of_bounds_is_422(self, client, payload):
-        r = client.post("/api/simulation/specimen", json=payload)
-        assert r.status_code == 422
-
     def test_bounds_match_limits_module(self):
         """The route bounds must track digital_twin.limits exactly."""
         from app.digital_twin.limits import (
-            CONTAMINATION_MAX_RATE, DRIFT_MAX_NM_PER_S)
-        from app.routes.simulation import DriftSettings, SpecimenSettings
+            CONTAMINATION_MAX_RATE_PCT, DRIFT_MAX_DT_S, DRIFT_MAX_NM_PER_S)
+        from app.routes.simulation import ContaminationSettings, DriftSettings
 
         f = DriftSettings.model_fields["vx_nm_per_s"]
         assert any(getattr(m, "le", None) == DRIFT_MAX_NM_PER_S
                    for m in f.metadata)
-        f = SpecimenSettings.model_fields["contamination_rate"]
-        assert any(getattr(m, "le", None) == CONTAMINATION_MAX_RATE
+        f = DriftSettings.model_fields["max_dt_s"]
+        assert any(getattr(m, "le", None) == DRIFT_MAX_DT_S
+                   for m in f.metadata)
+        f = ContaminationSettings.model_fields["rate"]
+        assert any(getattr(m, "le", None) == CONTAMINATION_MAX_RATE_PCT
                    for m in f.metadata)

@@ -121,8 +121,8 @@ class TestControlOnlyGuarantee:
         assert "class MicroscopeControlClient" in code
         assert "SimulationHarness" not in code
         # No simulation-only commands anywhere in the generated script.
-        for forbidden in ["load_sample", "set_environment", "set_drift",
-                          "set_specimen", "reset_specimen"]:
+        for forbidden in ["load_sample", "set_contamination", "set_noise",
+                          "set_drift", "set_thickness", "reset_specimen"]:
             assert forbidden not in code, f"sim-only call in script: {forbidden}"
 
     def test_template_script_compiles(self):

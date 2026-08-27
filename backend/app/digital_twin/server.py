@@ -35,7 +35,26 @@ def fov_um_to_mag(fov_um):
 # PHYSICS (items 1-5): dose noise, PSF, drift, thickness law, kinematical diff
 # ============================================================================
 def make_psf(defocus_nm, cs_mm=1.0, aperture_probe_px=1.4, kv=200.0, pixel_nm=1.0,
-             max_radius=24):
+             max_radius=96):
+    """Probe PSF: aperture, Cs, and the broadening that uniform defocus causes.
+
+    `max_radius` caps the kernel, and that cap is a real limit on how bad defocus
+    can get. sigma grows as 0.18 * defocus_nm / pixel_nm, so it is expressed in
+    PIXELS -- which means the cap bites *sooner at higher magnification*, where a
+    pixel is smaller. Once 3*sigma exceeds max_radius the kernel is truncated and
+    the blur stops growing, so lowering z further changes nothing.
+
+    The cap was 24 px, which saturated at |defocus| ~= 44 * pixel_nm:
+    0.43 um at a 5 um field, but only **0.087 um at 1 um** and **0.017 um at
+    0.2 um**. That is why defocus could appear to stop responding at high mag.
+    Raised to 96, extending the usable range 4x. Convolution is FFT-based
+    (convolve2d_fft), so cost is set by the image size, not the kernel -- a bigger
+    kernel is nearly free.
+
+    Note this is only ONE of two saturations. The depth-of-field term saturates
+    independently at |defocus| = dof_focus_gain_nm (2000 nm by default), and that
+    one is FOV-independent and tunable via set_optics.
+    """
     sigma0 = float(aperture_probe_px)
     cs_term = 0.15 * cs_mm * (200.0 / max(50.0, kv))
     defocus_px = abs(defocus_nm) / max(1e-3, pixel_nm)
@@ -53,6 +72,179 @@ def make_psf(defocus_nm, cs_mm=1.0, aperture_probe_px=1.4, kv=200.0, pixel_nm=1.
     if s > 0:
         psf /= s
     return psf
+
+
+DOF_N_LAYERS = 8            # depth buckets used by project_with_dof
+CONTAM_DOSE_SCALE = 7.7     # e-/A^2 for 1/e of contamination saturation
+
+
+def project_with_dof(vol, dX, dY, cx, cy, z0, tilt_a_deg=0.0, tilt_b_deg=0.0,
+                     defocus_nm=0.0, nm_per_vox_z=2.5, nm_per_px_xy=78.0,
+                     max_sigma_px=9.0, focus_gain_nm=2000.0, n_layers=DOF_N_LAYERS,
+                     wrap=False):
+    """
+    Project the specimen volume along the beam, WITH stage tilt and depth of field,
+    using a TRUE RIGID ROTATION of the specimen.
+
+    What changed in v6, and why
+    ---------------------------
+    Earlier builds tilted by SHEARING the sampling grid: slice z was displaced
+    laterally by `tan(angle) * tilt_strength_px_per_slice`, with that last factor a
+    hand-tuned 0.35. Two things were wrong with it.
+
+    * **The magnitude was a fudge.** For a 100 nm specimen on a 78 nm in-plane
+      pixel, the top slice of a 30-degree-tilted specimen is displaced by
+      100/2 * tan(30) = 28.9 nm = 0.36 px. The shear produced 3.94 px --
+      ~11x too large, and the error scaled with nothing physical.
+    * **Foreshortening was missing entirely.** Rotating a specimen compresses its
+      in-plane extent by cos(angle). At 30 degrees that is a 13.4% compression of
+      the whole field. The shear model did not compress at all.
+
+    Both fall out of doing the rotation properly. The specimen is rotated about Y
+    by beta then about X by alpha (the composition used by the reference shape
+    generator), and the projection integrates along the LAB beam axis:
+
+        x_lab = xs*cb - zs*sb
+        y_lab = ys*ca - (xs*sb + zs*cb)*sa
+        z_lab = ys*sa + (xs*sb + zs*cb)*ca        <- distance along the beam
+
+    Rendering inverts the first two for each specimen slice zs, which stays cheap
+    because both are AFFINE in the output coordinates -- one bilinear resample per
+    slice, exactly as before:
+
+        xs = (x_lab + zs*rz*sb) / cb
+        ys = (y_lab + (xs*sb + zs*rz*cb)*sa) / ca
+
+    with `rz = nm_per_vox_z / nm_per_px_xy` converting depth voxels to in-plane
+    pixels. The voxel grid is strongly anisotropic (~2.5 nm deep vs ~78 nm wide),
+    which is exactly why the fudge factor was so far off: it ignored that ratio.
+
+    Depth of field then needs NO separate tilt term. z_lab above IS the distance
+    along the beam, so
+
+        dz_nm = nm_per_px_xy * z_lab_in_px + defocus_nm
+
+    covers the specimen's own depth, the uniform defocus, AND the tilted focal
+    plane in one expression. The previous build carried a separate `tan(alpha)`
+    wedge bolted on beside the shear -- two descriptions of one rotation, which is
+    the sort of duplication that drifts out of agreement. There is now one.
+
+    Sigma is |dz_nm| * (max_sigma_px / focus_gain_nm), clipped -- unchanged, so
+    `dof_focus_gain_nm` and `dof_max_sigma_px` keep their meanings.
+
+    Parameters
+    ----------
+    vol           : (D, H, W) specimen volume.
+    dX, dY        : (out, out) output grids as OFFSETS from the field centre, in
+                    in-plane volume pixels. Rotation is about the field centre.
+    cx, cy        : field centre in volume-pixel coordinates.
+    z0            : mid-plane slice index, (D - 1) / 2.
+    tilt_a_deg    : stage alpha (rotation about x).
+    tilt_b_deg    : stage beta  (rotation about y).
+    defocus_nm    : uniform defocus (stage z minus focus plane), nm.
+    nm_per_vox_z  : depth voxel size, thickness_nm / D.
+    nm_per_px_xy  : in-plane volume pixel size, nm.
+    focus_gain_nm : nm of defocus mapping to FULL blur. Smaller = tighter DOF.
+    max_sigma_px  : blur ceiling, px. 0 disables depth of field.
+    n_layers      : number of blur buckets.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    vol = np.asarray(vol)
+    D = vol.shape[0]
+    max_sigma_px = max(0.0, float(max_sigma_px))
+    focus_gain_nm = max(1e-6, float(focus_gain_nm))
+    n_layers = max(2, int(n_layers))
+    gain = max_sigma_px / focus_gain_nm
+
+    ca, sa = np.cos(np.deg2rad(float(tilt_a_deg))), np.sin(np.deg2rad(float(tilt_a_deg)))
+    cb, sb = np.cos(np.deg2rad(float(tilt_b_deg))), np.sin(np.deg2rad(float(tilt_b_deg)))
+    ca = float(np.clip(ca, 1e-6, None)); cb = float(np.clip(cb, 1e-6, None))
+    rz = float(nm_per_vox_z) / max(1e-9, float(nm_per_px_xy))
+    untilted = (sa == 0.0 and sb == 0.0)
+
+    sigmas = np.linspace(0.0, max_sigma_px, n_layers)
+    step = float(sigmas[1] - sigmas[0])
+
+    def _blur(a, k):
+        s = float(sigmas[k])
+        return a if s < 0.3 else gaussian_filter(a, sigma=s).astype(np.float32)
+
+    def _slice_geom(z):
+        """Specimen sampling coords and beam depth (nm) for volume slice z."""
+        zs = float(z) - float(z0)
+        xs = (dX + zs * rz * sb) / cb
+        ys = (dY + (xs * sb + zs * rz * cb) * sa) / ca
+        dz_nm = float(nm_per_px_xy) * (ys * sa + (xs * sb + zs * rz * cb) * ca) \
+                + float(defocus_nm)
+        return xs, ys, dz_nm
+
+    def _walk(blurless=True):
+        out = np.zeros(dX.shape, dtype=np.float32)
+        for z in range(D):
+            xs, ys, _ = _slice_geom(z)
+            out += bilinear_sample(vol[z], cy + ys, cx + xs, wrap)
+        return out
+
+    if max_sigma_px <= 0.0:
+        return _walk()
+
+    # ---- no tilt: sigma is one number per slice -----------------------
+    if untilted:
+        z_idx = np.arange(D, dtype=np.float32)
+        dz = (z_idx - float(z0)) * float(nm_per_vox_z) + float(defocus_nm)
+        sig = np.clip(np.abs(dz) * gain, 0.0, max_sigma_px)
+        bins = np.clip(np.rint(sig / max(1e-9, step)).astype(np.int32), 0, n_layers - 1)
+        used = np.unique(bins)
+
+        # PERF (4k): with no tilt every slice samples the SAME grid, and bilinear
+        # sampling is linear in the slice values, so summing along z FIRST turns D
+        # full-resolution resamples into one. Algebraically exact; it is what makes
+        # 2048/4096 affordable.
+        if used.size == 1:
+            flat = bilinear_sample(vol.sum(axis=0, dtype=np.float32), cy + dY, cx + dX, wrap)
+            return _blur(flat, int(used[0]))
+
+        vox = {}
+        for z in range(D):
+            k = int(bins[z])
+            if k in vox: vox[k] += vol[z]
+            else:        vox[k] = np.array(vol[z], dtype=np.float32, copy=True)
+        out = np.zeros(dX.shape, dtype=np.float32)
+        for k, v in vox.items():
+            out += _blur(bilinear_sample(v, cy + dY, cx + dX, wrap), k)
+        return out.astype(np.float32)
+
+    # ---- tilted: sigma varies per pixel AND per slice ------------------
+    # Buckets are allocated lazily; a moderate tilt only touches a few, and at 2k/4k
+    # an eager (n_layers, H, W) pair would be hundreds of MB of empty planes.
+    parts, cover = {}, {}
+    ones = np.ones(dX.shape, dtype=np.float32)
+    for z in range(D):
+        xs, ys, dz_nm = _slice_geom(z)
+        samp = bilinear_sample(vol[z], cy + ys, cx + xs, wrap)
+        sig = np.clip(np.abs(dz_nm) * gain, 0.0, max_sigma_px)
+        bk = np.clip(np.rint(sig / max(1e-9, step)).astype(np.int32), 0, n_layers - 1)
+        # bincount is one pass; np.unique would sort the whole plane per slice.
+        for k in np.nonzero(np.bincount(bk.ravel(), minlength=n_layers))[0]:
+            k = int(k)
+            m = (bk == k)
+            if k not in parts:
+                parts[k] = np.zeros(dX.shape, dtype=np.float32)
+                cover[k] = np.zeros(dX.shape, dtype=np.float32)
+            np.add(parts[k], samp, where=m, out=parts[k])
+            np.add(cover[k], ones, where=m, out=cover[k])
+
+    # Coverage normalisation: blurring a masked fragment alone would bleed its cut
+    # edges into dark seams, so blur the signal AND the mask and divide. Every pixel
+    # receives D slice contributions, so num/den is the mean per slice and xD
+    # restores the projected sum.
+    num = np.zeros(dX.shape, dtype=np.float32)
+    den = np.zeros(dX.shape, dtype=np.float32)
+    for k in parts:
+        num += _blur(parts[k], k)
+        den += _blur(cover[k], k)
+    return (num / np.maximum(den, 1e-6) * float(D)).astype(np.float32)
 
 
 def convolve2d_fft(img, psf):
@@ -527,7 +719,27 @@ class SimMicroscope:
         "total_nm": 100.0, "working_nm": 100.0, "z_start_nm": 0.0, "seed": 0,
     })
     # NEW: aberrations & optics
-    optics: Dict[str, float] = field(default_factory=lambda: {"cs_mm": 1.0, "aperture_probe_px": 1.4})
+    optics: Dict[str, float] = field(default_factory=lambda: {
+        "cs_mm": 1.0, "aperture_probe_px": 1.4,
+        # depth-of-field / tilted-focal-plane blur (see project_with_dof).
+        # Unchanged keys, unchanged meanings, unchanged RPC surface -- only the
+        # stage of the pipeline that consumes them moved.
+        # Raised 350 -> 2000 from visual inspection. At 350 the in-focus band on a
+        # tilted specimen was ~0.35 um wide, which reads as a hard stripe rather
+        # than a depth of field. 2000 nm puts the band half-width at
+        # gain/(1000*sin(alpha)) = 4 um at alpha=30, i.e. more than half of a
+        # 15 um field, which is what a real tilted foil looks like.
+        "dof_focus_gain_nm": 2000.0,  # nm of defocus -> full blur; SMALLER = tighter
+                                      # in-focus band, blur bites sooner
+        # Blur CEILING. 9 is the sensible untilted value. On a TILTED specimen the
+        # far edges of the field sit much further from focus, so the ceiling
+        # should rise with tilt or the edges saturate at the same softness however
+        # hard you tilt. A workable rule, from visual inspection:
+        #     dof_max_sigma_px = max(9.0, 3.0 * sqrt(alpha**2 + beta**2))
+        # applied per frame via set_optics. Left at 9.0 here because the default
+        # has no tilt to scale against.
+        "dof_max_sigma_px": 9.0,      # maximum blur strength, in pixels
+    })
     # NEW: drift state (accumulates over time)
     drift: Dict[str, float] = field(default_factory=lambda: {
         "vx_px_per_s": 0.0, "vy_px_per_s": 0.0,   # constant drift velocity
@@ -536,17 +748,16 @@ class SimMicroscope:
         "enabled": 0.0,
         "max_dt_s": 2.0,   # cap on per-frame elapsed time (idle-jump guard)
     })
-    # NEW: beam damage + contamination (specimen-degradation effects)
+    # Specimen-degradation effects. Beam damage was REMOVED in v5 (changelog
+    # Part 4). Contamination is the one degradation mechanism the twin keeps,
+    # because it is GEOMETRIC -- it leaves a footprint in a definite place that a
+    # workflow has to notice and navigate around -- rather than a contrast decay
+    # curve with no spatial story.
     specimen: Dict[str, float] = field(default_factory=lambda: {
-        # beam damage: cumulative dose above 'damage_dose_threshold' (e-/A^2)
-        # progressively removes signal in the exposed region.
-        "beam_damage_enabled": 0.0,
-        "damage_dose_threshold": 3.0e4,    # e-/A^2 critical dose (moderately robust)
-        "damage_rate": 1.0,                # contrast-loss speed for dose past threshold
-        # contamination: carbon builds up where the beam dwells, darkening the
-        # image and adding diffuse background to diffraction over time.
+        # carbon builds up where the beam dwells, adding projected mass-thickness
+        # and leaving a visible bright "scan box" footprint.
         "contamination_enabled": 0.0,
-        "contamination_rate": 1.0,         # carbon build-up rate (0-5 typical)
+        "contamination_rate": 100.0,       # carbon build-up rate
     })
 
 
@@ -577,17 +788,32 @@ def sharpness_metric(img_u16):
     return float(gx + gy)
 
 
-def bilinear_sample(img, y, x):
+def bilinear_sample(img, y, x, wrap=False):
+    """Bilinear resample. `wrap=True` makes the volume periodic, which is what
+    lets the sampling window walk off one edge and reappear on the other instead
+    of hitting a wall.
+
+    NOTE: the interpolation weights are computed from the UNCLAMPED positions.
+    The previous version derived them from the clamped indices, so at the last
+    half-pixel of a border `x1 - x` went negative and the four weights summed to
+    zero -- a one-pixel dark rim on every clamped edge. Harmless while the window
+    never reached an edge; not harmless once roaming puts it there routinely.
+    """
     H, W = img.shape
-    x0 = np.floor(x).astype(np.int32); y0 = np.floor(y).astype(np.int32)
-    x1 = x0 + 1; y1 = y0 + 1
-    x0 = np.clip(x0, 0, W - 1); x1 = np.clip(x1, 0, W - 1)
-    y0 = np.clip(y0, 0, H - 1); y1 = np.clip(y1, 0, H - 1)
+    y0f = np.floor(y); x0f = np.floor(x)
+    y0 = y0f.astype(np.int32); x0 = x0f.astype(np.int32)
+    y1 = y0 + 1; x1 = x0 + 1
+    wx = (x - x0f).astype(np.float32)
+    wy = (y - y0f).astype(np.float32)
+    if wrap:
+        x0 = np.mod(x0, W); x1 = np.mod(x1, W)
+        y0 = np.mod(y0, H); y1 = np.mod(y1, H)
+    else:
+        x0 = np.clip(x0, 0, W - 1); x1 = np.clip(x1, 0, W - 1)
+        y0 = np.clip(y0, 0, H - 1); y1 = np.clip(y1, 0, H - 1)
     Ia = img[y0, x0].astype(np.float32); Ib = img[y1, x0].astype(np.float32)
     Ic = img[y0, x1].astype(np.float32); Id = img[y1, x1].astype(np.float32)
-    wa = (x1 - x) * (y1 - y); wb = (x1 - x) * (y - y0)
-    wc = (x - x0) * (y1 - y); wd = (x - x0) * (y - y0)
-    return Ia*wa + Ib*wb + Ic*wc + Id*wd
+    return (Ia*(1-wx)*(1-wy) + Ib*(1-wx)*wy + Ic*wx*(1-wy) + Id*wx*wy)
 
 
 # ============================================================================
@@ -615,25 +841,24 @@ class STEMServer(object):
         self.current_sample = None
         self.sample_fov_um = 200.0
         self.sample_px_per_um = 1.0
-        self.tilt_strength_px_per_slice = 0.35
         # thickness law scale (raw projected-sum units that give ~63% signal)
         self.mfp_scale = 2000.0
         self._last_acquire_t = time.time()
-        # Specimen-degradation maps (sample-frame, low-res grids that accumulate
+        # Contamination map (sample-frame, low-res grid that accumulates
         # exposure). Allocated lazily per-sample in _ensure_specimen_maps().
-        self._dose_map = None          # cumulative dose proxy (e-/A^2-ish)
         self._contam_map = None        # cumulative contamination thickness proxy
-        self._specimen_grid = 128      # resolution of the maps
+        self._specimen_grid = 128      # resolution of the map
+        # World-pixel offset of the cached volume's top-left. Only moves for
+        # samples that advertise supports_roaming.
+        self._vol_origin_px = (0.0, 0.0)
 
     def _ensure_specimen_maps(self):
         g = self._specimen_grid
-        if self._dose_map is None or self._dose_map.shape != (g, g):
-            self._dose_map = np.zeros((g, g), dtype=np.float32)
+        if self._contam_map is None or self._contam_map.shape != (g, g):
             self._contam_map = np.zeros((g, g), dtype=np.float32)
 
     def reset_specimen(self):
-        """Clear accumulated beam damage and contamination (fresh specimen)."""
-        self._dose_map = None
+        """Clear accumulated contamination (fresh specimen)."""
         self._contam_map = None
         self._ensure_specimen_maps()
         self._log("reset_specimen", {}, "cleared")
@@ -723,7 +948,6 @@ class STEMServer(object):
             self.current_sample = sample
             self.sample_fov_um = sample.sample_fov_um
             self.sample_px_per_um = W / self.sample_fov_um
-            self.tilt_strength_px_per_slice = sample.tilt_strength_px_per_slice
             # Clamp each detector's FOV to the generated range. An atomistic
             # sample (e.g. atomsk_polycrystal) may declare a world far smaller
             # than the 20 um default FOV; without this the first frame images
@@ -823,7 +1047,9 @@ class STEMServer(object):
     # ---- optics (NEW: aberrations) ----
     def get_optics(self):
         o = self.sim.optics
-        r = {"cs_mm": float(o["cs_mm"]), "aperture_probe_px": float(o["aperture_probe_px"])}
+        r = {"cs_mm": float(o["cs_mm"]), "aperture_probe_px": float(o["aperture_probe_px"]),
+             "dof_focus_gain_nm": float(o.get("dof_focus_gain_nm", 2000.0)),
+             "dof_max_sigma_px": float(o.get("dof_max_sigma_px", 9.0))}
         self._log("get_optics", {}, r)
         return r
 
@@ -832,6 +1058,10 @@ class STEMServer(object):
             self.sim.optics["cs_mm"] = float(kwargs["cs_mm"])
         if "aperture_probe_px" in kwargs and kwargs["aperture_probe_px"] is not None:
             self.sim.optics["aperture_probe_px"] = float(kwargs["aperture_probe_px"])
+        if "dof_focus_gain_nm" in kwargs and kwargs["dof_focus_gain_nm"] is not None:
+            self.sim.optics["dof_focus_gain_nm"] = float(kwargs["dof_focus_gain_nm"])
+        if "dof_max_sigma_px" in kwargs and kwargs["dof_max_sigma_px"] is not None:
+            self.sim.optics["dof_max_sigma_px"] = float(kwargs["dof_max_sigma_px"])
         r = self.get_optics()
         self._log("set_optics", kwargs, r)
         return r
@@ -845,7 +1075,8 @@ class STEMServer(object):
 
     def set_drift(self, vx_px_per_s=None, vy_px_per_s=None, line_jitter_px=None,
                   enabled=None, reset_accum=False,
-                  vx_nm_per_s=None, vy_nm_per_s=None, line_jitter_nm=None):
+                  vx_nm_per_s=None, vy_nm_per_s=None, line_jitter_nm=None,
+                  max_dt_s=None):
         """Set stage drift. PREFER the physical nm/s interface (vx_nm_per_s,
         vy_nm_per_s) and line_jitter_nm -- these are TEM-realistic units and are
         converted to the internal volume-pixel rates using the current volume
@@ -862,6 +1093,14 @@ class STEMServer(object):
         if vy_px_per_s is not None: d["vy_px_per_s"] = float(vy_px_per_s)
         if line_jitter_px is not None: d["line_jitter_px"] = float(line_jitter_px)
         if enabled is not None: d["enabled"] = 1.0 if enabled else 0.0
+        if max_dt_s is not None:
+            # Cap on the elapsed time a SINGLE frame may accrue drift over. It
+            # exists so that leaving the notebook idle for an hour does not
+            # teleport the field on the next acquisition. The default 2 s is
+            # deliberately short, which means a demo that sleeps 100 s between
+            # frames still only gets 2 s of drift -- raise this to let a long
+            # deliberate wait actually accumulate.
+            d["max_dt_s"] = max(0.0, float(max_dt_s))
         if reset_accum:
             d["accum_x_px"] = 0.0; d["accum_y_px"] = 0.0
             self._last_acquire_t = time.time()
@@ -870,32 +1109,63 @@ class STEMServer(object):
         nm_per_px = (1.0 / px_per_nm) if px_per_nm > 0 else 26.04
         r["vx_nm_per_s"] = d["vx_px_per_s"] * nm_per_px
         r["vy_nm_per_s"] = d["vy_px_per_s"] * nm_per_px
-        self._log("set_drift", {"vx_nm_per_s": vx_nm_per_s, "vy_nm_per_s": vy_nm_per_s,
-                                "vx_px_per_s": vx_px_per_s, "vy_px_per_s": vy_px_per_s}, r)
+        self._log("set_drift", {"vx_nm_per_s": vx_nm_per_s, "vy_nm_per_s": vy_nm_per_s}, r)
         return r
 
-    # ---- specimen degradation (NEW: beam damage + contamination) ----
+    # ---- specimen degradation (contamination only) ----
     def get_specimen(self):
         s = self.sim.specimen
         r = {k: float(s[k]) for k in s}
-        # report a summary of accumulated maps
-        if self._dose_map is not None:
-            r["max_accumulated_dose"] = float(self._dose_map.max())
+        # report a summary of the accumulated map
+        if self._contam_map is not None:
             r["max_contamination"] = float(self._contam_map.max())
         self._log("get_specimen", {}, r)
         return r
 
-    def set_specimen(self, **kwargs):
+    def set_contamination(self, enabled=None, rate=None):
+        """Contamination: carbon accumulating where the beam dwells.
+
+        `rate` is a PERCENTAGE knob -- 100 is the calibrated nominal rate, 200 is
+        twice as fast, 0 is off. Contamination is only observable over a window:
+        below ~0.3 e-/A^2 per frame nothing accumulates visibly, above ~20 the
+        first frame already saturates. At 80 pA / 20 us that is roughly 5-30 um
+        FOV at 1024 px, shifting down 4x in FOV per doubling of resolution.
+        """
         s = self.sim.specimen
-        for key in ["damage_dose_threshold", "damage_rate", "contamination_rate"]:
-            if kwargs.get(key) is not None:
-                s[key] = float(kwargs[key])
-        if kwargs.get("beam_damage_enabled") is not None:
-            s["beam_damage_enabled"] = 1.0 if kwargs["beam_damage_enabled"] else 0.0
-        if kwargs.get("contamination_enabled") is not None:
-            s["contamination_enabled"] = 1.0 if kwargs["contamination_enabled"] else 0.0
+        if rate is not None:
+            s["contamination_rate"] = float(rate)
+        if enabled is not None:
+            s["contamination_enabled"] = 1.0 if enabled else 0.0
         r = self.get_specimen()
-        self._log("set_specimen", kwargs, r)
+        self._log("set_contamination", {"enabled": enabled, "rate": rate}, r)
+        return r
+
+    def set_noise(self, dwell_us=None, dqe=None, readout_e=None,
+                  use_dose_model=None, noise_sigma=None, device="haadf"):
+        """Detector / dose parameters -- everything that governs how noisy a frame is.
+
+        dwell_us       longer dwell = more electrons per pixel = less shot noise
+        dqe            detector quantum efficiency, 0-1
+        readout_e      readout noise, electrons RMS
+        use_dose_model 1 = Poisson dose statistics, 0 = legacy gaussian
+        noise_sigma    gaussian sigma for the legacy path only
+        """
+        d = self.detectors[device]
+        for k, v in (("dwell_us", dwell_us), ("dqe", dqe), ("readout_e", readout_e),
+                     ("use_dose_model", use_dose_model), ("noise_sigma", noise_sigma)):
+            if v is not None:
+                d[k] = float(v)
+        r = {k: float(d[k]) for k in ("dwell_us", "dqe", "readout_e",
+                                      "use_dose_model", "noise_sigma") if k in d}
+        self._log("set_noise", {"device": device}, r)
+        return r
+
+    def set_autofocus_limits(self, min_contrast=None):
+        """Peak/floor ratio below which autofocus reports non-convergence."""
+        if min_contrast is not None:
+            self.sim.specimen["af_min_contrast"] = float(min_contrast)
+        r = {"af_min_contrast": float(self.sim.specimen.get("af_min_contrast", 0.08))}
+        self._log("set_autofocus_limits", {"min_contrast": min_contrast}, r)
         return r
 
     # ---- mode / diffraction ----
@@ -906,96 +1176,12 @@ class STEMServer(object):
 
     def set_mode(self, mode="IMG"):
         m = str(mode).upper().strip()
-        if m not in ("IMG", "DIFF", "EELS"):
-            raise ValueError("mode must be 'IMG', 'DIFF', or 'EELS'")
+        if m not in ("IMG", "DIFF"):
+            raise ValueError("mode must be 'IMG' or 'DIFF'")
         self.sim.mode = m
         r = {"mode": m}
         self._log("set_mode", {"mode": mode}, r)
         return r
-
-    def acquire_spectrum(self, ev_min=0.0, ev_max=1000.0, n_channels=1024,
-                         cx_um=None, cy_um=None):
-        """Acquire a single-spot EELS spectrum (probe parked at one position).
-
-        This mirrors the 4D-STEM/EELS acquisition geometry: the focused probe sits
-        at ONE point and a 1-D spectrum is recorded. The spectrum here is a
-        physically-structured DUMMY (not quantitatively accurate): a zero-loss peak
-        at 0 eV, a plasmon peak in the low-loss region, and composition-aware
-        core-loss edges placed at approximate ionization energies of the elements
-        actually under the probe (from the sample's atoms). Intensities scale with
-        the working specimen thickness. The value is the WORKFLOW and the API
-        surface -- swap in a real EELS backend on a microscope later.
-
-        Returns {"energy_ev": [...], "intensity": [...], "edges": [{...}], ...}.
-        """
-        self._require_ready()
-        E = np.linspace(float(ev_min), float(ev_max), int(n_channels)).astype(np.float64)
-        spec = np.zeros_like(E)
-
-        # thickness scaling (thicker -> stronger plasmon relative to zero-loss)
-        th = getattr(self.sim, "thickness", {"working_nm": 100.0, "total_nm": 100.0})
-        t_nm = float(th.get("working_nm", 100.0))
-        t_over_lambda = t_nm / 100.0   # ~ t/inelastic-mean-free-path (order 1)
-
-        # (1) zero-loss peak (Gaussian at 0 eV)
-        zlp_w = 0.8
-        spec += np.exp(-0.5 * (E / zlp_w) ** 2)
-
-        # (2) plasmon peak(s): position depends loosely on material; single plasmon
-        #     around ~15-25 eV, amplitude grows with thickness (multiple scattering)
-        Zset = self._atoms_under_probe_Z(cx_um, cy_um)
-        Ep = 15.0 + 0.10 * (float(np.mean(Zset)) if len(Zset) else 15.0)  # crude
-        plasmon_amp = 0.35 * t_over_lambda
-        spec += plasmon_amp * np.exp(-0.5 * ((E - Ep) / 3.0) ** 2)
-        # double plasmon at 2*Ep for thicker specimens
-        spec += 0.4 * plasmon_amp**2 * np.exp(-0.5 * ((E - 2 * Ep) / 4.0) ** 2)
-
-        # (3) core-loss edges for the elements under the probe. Approximate edge
-        #     onset energies (eV) for a few common elements/edges.
-        EDGES = {
-            6:  [("C-K", 284)], 8: [("O-K", 532)], 12: [("Mg-K", 1305)],
-            13: [("Al-K", 1560)], 14: [("Si-K", 1839)], 22: [("Ti-L", 456)],
-            26: [("Fe-L", 708)], 29: [("Cu-L", 931)], 79: [("Au-M", 2206)],
-        }
-        edges_out = []
-        for Z in Zset:
-            for (name, e0) in EDGES.get(int(Z), []):
-                if E[0] <= e0 <= E[-1]:
-                    # saw-tooth edge: sharp onset then ~E^-r decay
-                    amp = 0.08 * t_over_lambda
-                    tail = np.where(E >= e0, amp * ((e0 / np.clip(E, e0, None)) ** 3), 0.0)
-                    spec += tail
-                    edges_out.append({"label": name, "onset_ev": e0, "Z": int(Z)})
-
-        # gentle decreasing background (power law) + Poisson-like noise
-        bg = 0.02 * np.clip((E + 5.0), 1, None) ** (-0.3)
-        spec = spec + bg
-        rng = np.random.default_rng(0)
-        spec = spec * (1.0 + 0.02 * rng.standard_normal(spec.shape))
-        spec = np.clip(spec, 0, None)
-
-        r = {"energy_ev": E.tolist(), "intensity": spec.tolist(),
-             "edges": edges_out, "zlp_ev": 0.0, "plasmon_ev": float(Ep),
-             "thickness_nm": t_nm, "elements_Z": sorted(int(z) for z in Zset)}
-        self._log("acquire_spectrum",
-                  {"ev_min": ev_min, "ev_max": ev_max, "n_channels": n_channels},
-                  f"EELS spectrum ({len(E)} ch, edges={[e['label'] for e in edges_out]})")
-        return r
-
-    def _atoms_under_probe_Z(self, cx_um=None, cy_um=None):
-        """Set of atomic numbers present in a small region under the probe, from
-        the current sample. Falls back to a light element if none available."""
-        s = getattr(self, "current_sample", None)
-        if s is None or not hasattr(s, "get_atoms_in_region"):
-            return np.array([6])   # carbon fallback
-        try:
-            cx = 0.0 if cx_um is None else float(cx_um)
-            cy = 0.0 if cy_um is None else float(cy_um)
-            _, Z = s.get_atoms_in_region(cx, cy, 0.01, 10.0)
-            Z = np.asarray(Z)
-            return np.unique(Z) if Z.size else np.array([6])
-        except Exception:
-            return np.array([6])
 
     def get_diffraction_settings(self):
         d = self.sim.diff
@@ -1180,8 +1366,17 @@ class STEMServer(object):
         sx_um = self.sim.stage["x"] * 1e6
         sy_um = self.sim.stage["y"] * 1e6
         W = self.vol.shape[2]; H = self.vol.shape[1]
-        cx = (0.5 * W + (sx_um * self.sample_px_per_um)) % W
-        cy = (0.5 * H + (sy_um * self.sample_px_per_um)) % H
+        # The sampling window is tracked in ABSOLUTE world pixels for every
+        # roaming sample. Earlier builds had two different edge behaviours for
+        # what is physically one motion: a stage move WRAPPED modulo the volume
+        # while accumulated drift CLAMPED at a margin. A workflow correcting drift
+        # by issuing stage moves saw them disagree at the boundary.
+        roaming = bool(getattr(self.current_sample, "supports_roaming", True))
+        mode = str(getattr(self.current_sample, "roaming_mode", "periodic"))
+        wx = 0.5 * W + (sx_um * self.sample_px_per_um)
+        wy = 0.5 * H + (sy_um * self.sample_px_per_um)
+        if not roaming:
+            cx, cy = wx % W, wy % H
 
         # Item 3: update accumulated drift BEFORE choosing the sampling center, so
         # successive frames are translated relative to one another. (Skip during
@@ -1189,6 +1384,8 @@ class STEMServer(object):
         intra_dx = intra_dy = 0.0
         if not for_autofocus and self.sim.drift.get("enabled", 0.0) >= 0.5:
             now = time.time()
+            # Drift is driven by REAL elapsed wall-clock time between acquisitions
+            # (velocity x dt), so the rate you set means "nm per real second". We
             # cap dt so that a long idle gap (e.g. the sample sits loaded while the
             # user reads the panel, then acquires) does not teleport the field in a
             # single huge jump -- on a real scope you'd re-center before starting.
@@ -1205,44 +1402,94 @@ class STEMServer(object):
             # region, not into blackness. We do NOT wrap modulo the volume (which
             # would jump to the far edge / vacuum); we clamp so the window stays
             # over generated specimen.
-            cx = float(cx + self.sim.drift["accum_x_px"])
-            cy = float(cy + self.sim.drift["accum_y_px"])
-            margin = 0.5 * fov_um * self.sample_px_per_um + 2
-            cx = min(max(cx, margin), W - margin)
-            cy = min(max(cy, margin), H - margin)
+            wx = float(wx + self.sim.drift["accum_x_px"])
+            wy = float(wy + self.sim.drift["accum_y_px"])
+            if not roaming:
+                cx = float(cx + self.sim.drift["accum_x_px"])
+                cy = float(cy + self.sim.drift["accum_y_px"])
+                margin = 0.5 * fov_um * self.sample_px_per_um + 2
+                cx = min(max(cx, margin), W - margin)
+                cy = min(max(cy, margin), H - margin)
             # intra-frame drift (shear within one frame) computed from frame time
             frame_t = float(det["dwell_us"]) * 1e-6 * out_size * out_size
             intra_dx = self.sim.drift["vx_px_per_s"] * frame_t
             intra_dy = self.sim.drift["vy_px_per_s"] * frame_t
 
+        wrap_sampling = False
+        if roaming and mode == "world":
+            # WORLD roaming: the sample generates from a position hash, so any
+            # patch can be made on demand. Re-tile when the window nears the edge
+            # of the cached volume. Genuinely unbounded and non-repeating.
+            half_px = 0.5 * fov_um * self.sample_px_per_um
+            ox, oy = self._vol_origin_px
+            cx = wx - ox
+            cy = wy - oy
+            edge = half_px + 4
+            if not (edge <= cx <= W - edge and edge <= cy <= H - edge):
+                ox = wx - 0.5 * W
+                oy = wy - 0.5 * H
+                self.vol = np.asarray(
+                    self.current_sample.generate_volume_at(
+                        self.vol_D, H, W, origin_x_px=ox, origin_y_px=oy),
+                    dtype=np.float32)
+                self._vol_origin_px = (ox, oy)
+                cx = wx - ox
+                cy = wy - oy
+        elif roaming:
+            # PERIODIC roaming (the default, and what every sample that does not
+            # implement a world generator gets): the volume is treated as one
+            # tile of an endlessly repeating specimen. The window centre is left
+            # in absolute coordinates and the SAMPLER wraps, so no volume is ever
+            # regenerated and no copy is made -- driving or drifting simply walks
+            # off one edge and onto the other.
+            #
+            # Honest limitation: the specimen REPEATS with period
+            # generation_range_um (20 um by default). At a realistic drift of
+            # ~1 nm/s that is ~5.5 hours of travel before anything recurs, but it
+            # is periodicity, not an infinite specimen. Only samples with
+            # roaming_mode = "world" are genuinely non-repeating.
+            cx, cy = wx, wy
+            wrap_sampling = True
+
+        # Output grids as OFFSETS from the field centre: the tilt rotation is
+        # about the centre of the field, so the projection needs them centred.
         half = 0.5 * fov_um * self.sample_px_per_um
-        xs = np.linspace(cx - half, cx + half, out_size, dtype=np.float32)
-        ys = np.linspace(cy - half, cy + half, out_size, dtype=np.float32)
-        Y0, X0 = np.meshgrid(ys, xs, indexing="ij")
+        _o = np.linspace(-half, half, out_size, dtype=np.float32)
+        dY, dX = np.meshgrid(_o, _o, indexing="ij")
 
         a_deg = float(self.sim.stage.get("a", 0.0))
         b_deg = float(self.sim.stage.get("b", 0.0))
-        sa = np.tan(np.deg2rad(a_deg)) * self.tilt_strength_px_per_slice
-        sb = np.tan(np.deg2rad(b_deg)) * self.tilt_strength_px_per_slice
 
         D = self.vol_D
         z0 = (D - 1) * 0.5
-        if sa == 0.0 and sb == 0.0:
-            # PERF (4k): with no tilt every z-slice samples the SAME (Yq, Xq)
-            # grid, and bilinear sampling is linear in the slice values, so
-            # sum_z bilinear(vol[z]) == bilinear(sum_z vol[z]). Summing along z
-            # first turns D resamples into one -- algebraically exact, verified
-            # to ~1e-6 relative (well under one 16-bit quantisation step).
-            # Measured at 4096 px, D=40: 178 s -> 4.7 s.
-            proj = bilinear_sample(
-                np.asarray(self.vol).sum(axis=0, dtype=np.float32), Y0, X0)
-        else:
-            proj = np.zeros((out_size, out_size), dtype=np.float32)
-            for z in range(D):
-                dz = (z - z0)
-                Xq = X0 - sb * dz
-                Yq = Y0 - sa * dz
-                proj += bilinear_sample(self.vol[z], Yq, Xq)
+
+        # Physical pixel size and uniform defocus are needed BEFORE the projection,
+        # because depth of field is applied per depth slice while z still exists.
+        dz_um = (self.sim.stage["z"] - self.focus_plane_z_m) * 1e6
+        defocus_nm = dz_um * 1000.0
+        nm_per_px = (fov_um * 1000.0) / max(1, out_size)
+
+        # Voxel geometry. The grid is strongly anisotropic: the D axis spans the
+        # specimen's physical thickness while the in-plane axes span the generation
+        # range, so a depth voxel is ~2.5 nm and an in-plane pixel ~78 nm. The
+        # rotation has to know that ratio -- getting it wrong is precisely what made
+        # the old shear model 11x too strong.
+        _th = getattr(self.sim, "thickness", None)
+        _total_nm = (float(_th["total_nm"]) if _th else
+                     float(getattr(self.current_sample, "thickness_nm", 100.0)))
+        nm_per_vox_z = max(1e-6, _total_nm / max(1, D))
+        nm_per_px_xy = 1000.0 / max(1e-9, self.sample_px_per_um)
+
+        proj = project_with_dof(
+            self.vol, dX, dY, cx, cy, z0,
+            tilt_a_deg=a_deg, tilt_b_deg=b_deg,
+            defocus_nm=defocus_nm,
+            nm_per_vox_z=nm_per_vox_z,
+            nm_per_px_xy=nm_per_px_xy,
+            focus_gain_nm=float(self.sim.optics.get("dof_focus_gain_nm", 2000.0)),
+            max_sigma_px=float(self.sim.optics.get("dof_max_sigma_px", 9.0)),
+            wrap=wrap_sampling,
+        )
 
         # Item 4: thickness saturation + Z-contrast-ish nonlinearity already
         # baked into per-sample intensities. Convert raw sum -> scattering frac.
@@ -1253,14 +1500,12 @@ class STEMServer(object):
             proj = proj * (float(th["working_nm"]) / float(th["total_nm"]))
         signal = thickness_contrast(proj, self.mfp_scale)  # in [0,1)
 
-        # Item 2: PSF convolution (defocus + aberrations)
-        dz_um = (self.sim.stage["z"] - self.focus_plane_z_m) * 1e6
-        defocus_nm = dz_um * 1000.0
-        # Physical pixel size so defocus blur scales correctly with FOV. A wide
-        # FOV means each pixel covers more sample, so a given defocus blurs fewer
-        # pixels; a narrow FOV resolves the blur. Without this the defocus_px term
-        # saturated instantly and the autofocus curve was flat.
-        nm_per_px = (fov_um * 1000.0) / max(1, out_size)
+        # Item 2: PSF convolution (defocus + aberrations). This is the PROBE:
+        # aperture, Cs and the probe broadening that uniform defocus causes. It
+        # is uniform over the frame. The depth-of-field term (per slice, applied
+        # in project_with_dof above) is the specimen-side counterpart; the two
+        # are independent and both belong here.
+        # defocus_nm and nm_per_px were computed before the projection.
         psf = make_psf(defocus_nm,
                        cs_mm=float(self.sim.optics["cs_mm"]),
                        aperture_probe_px=float(self.sim.optics["aperture_probe_px"]),
@@ -1292,7 +1537,9 @@ class STEMServer(object):
         # High-resolution atomic columns for crystalline samples. A single crystal
         # is a featureless slab at low/moderate magnification; only when the FOV is
         # small enough to resolve the atomic-column spacing do columns appear -- as
-        # on a real HAADF instrument. Columns are projected from the sample's
+        # on a real HAADF instrument. We render the columns by PROJECTING the real
+        # atoms (true Angstrom positions from the lattice) along the TILTED beam,
+        # rather than synthesizing sinusoidal fringes. Columns are projected from the sample's
         # REAL atoms (see _render_atomic_columns). We still consult the lattice
         # only to decide whether columns are RESOLVABLE at this pixel size, using
         # the TRUE projected column spacing (FCC[111] projects to a/sqrt(6)=1.46A,
@@ -1348,15 +1595,13 @@ class STEMServer(object):
         voltage_scale = max(0.1, min(3.0, voltage_kV / 200.0))
         signal = signal * (1.0 / (0.85 + 0.15 * voltage_scale))
 
-        # --- Specimen degradation: beam damage + contamination (review 2) ---
+        # --- Specimen degradation: contamination ---
         # Accumulate exposure in the region currently under the beam, then apply
         # the cumulative effect. Skipped during autofocus so it doesn't corrupt
-        # focus scoring (though damage during AF is modeled separately by passing
-        # for_autofocus and still reading the current maps).
+        # focus scoring.
         sp = self.sim.specimen
-        damage_on = float(sp.get("beam_damage_enabled", 0.0)) >= 0.5
         contam_on = float(sp.get("contamination_enabled", 0.0)) >= 0.5
-        if damage_on or contam_on:
+        if contam_on:
             self._ensure_specimen_maps()
             g = self._specimen_grid
             # Map the current FOV window to a sub-rectangle of the specimen grid.
@@ -1369,25 +1614,26 @@ class STEMServer(object):
             gx1 = int(np.clip((cxn + half_f) * g, 0, g-1)) + 1
             gy0 = int(np.clip((cyn - half_f) * g, 0, g-1))
             gy1 = int(np.clip((cyn + half_f) * g, 0, g-1)) + 1
-            # Exposure increment per acquisition, in REAL electrons/A^2 (the unit
-            # damage_dose_threshold is expressed in). This correctly depends on
-            # probe current, dwell time, AND the pixel size on the specimen, which
-            # is set by FOV and RESOLUTION: dose = electrons_per_pixel / pixel_area,
-            # pixel_area = (FOV/resolution)^2. So a smaller FOV or a higher
-            # resolution concentrates dose and damages faster -- as on a real
-            # instrument. (Earlier builds used an arbitrary unit that ignored this.)
+            # Exposure increment per acquisition, in REAL electrons/A^2. This
+            # correctly depends on probe current, dwell time, AND the pixel size on
+            # the specimen, which is set by FOV and RESOLUTION:
+            #     dose = electrons_per_pixel / pixel_area,  pixel_area = (FOV/res)^2
+            # So a smaller FOV or a higher resolution concentrates dose and
+            # contaminates faster -- as on a real instrument.
             _dwell_s = float(det.get("dwell_us", 20.0)) * 1e-6
             _e_per_px = (current_pA * 1e-12 / 1.602e-19) * _dwell_s
             _pix_nm = (fov_um * 1000.0) / max(1, out_size)      # nm per acquisition pixel
             _pix_A2 = max(1e-6, (_pix_nm * 10.0) ** 2)          # A^2 per pixel
             inc = _e_per_px / _pix_A2                            # e-/A^2 added this frame
             if not for_autofocus and (gx1 > gx0) and (gy1 > gy0):
-                if damage_on:
-                    self._dose_map[gy0:gy1, gx0:gx1] += inc
-                if contam_on:
-                    # contamination grows with exposure (per-frame dwell-dose), scaled
-                    # by the contamination_rate; independent of the damage threshold.
-                    self._contam_map[gy0:gy1, gx0:gx1] += (inc / 3.0e3) * float(sp.get("contamination_rate", 1.0))
+                # Contamination grows with exposure. The map holds accumulated
+                # e-/A^2 scaled by contamination_rate, which is a PERCENTAGE knob:
+                # 100 = the calibrated nominal rate, 200 = twice as fast, 0 = off.
+                # (v5 recalibrated this. The old constants made the effect ~1000x
+                # too slow to see: 12 frames of concentrated dose moved the mean
+                # signal by ~50 counts out of 60000, which is why the footprint
+                # demos never showed a footprint.)
+                self._contam_map[gy0:gy1, gx0:gx1] += inc * (float(sp.get("contamination_rate", 100.0)) / 100.0)
             from scipy.ndimage import zoom as _zoom
             def _patch_to_out(maparr):
                 patch = maparr[gy0:gy1, gx0:gx1]
@@ -1395,40 +1641,19 @@ class STEMServer(object):
                     return np.zeros((out_size, out_size), dtype=np.float32)
                 zy = out_size / patch.shape[0]; zx = out_size / patch.shape[1]
                 return _zoom(patch, (zy, zx), order=1)[:out_size, :out_size]
-            # Two DISTINCT effects, applied after dose-model renormalization
-            # (per-frame max-normalization would otherwise cancel a uniform change):
-            #   - Beam DAMAGE: mass loss / sputtering removes scatterers, so the
-            #     HAADF signal DROPS -> multiplicative attenuation (->0), darker.
-            #   - CONTAMINATION: carbon builds up where the beam dwells, ADDING
-            #     projected mass-thickness. HAADF signal scales with mass-thickness,
-            #     so contaminated regions get BRIGHTER -> additive brightening.
-            # 1.0 = pristine for the damage factor; 0.0 = none for contam brighten.
-            self._degradation_factor = np.ones((out_size, out_size), dtype=np.float32)
-            self._contam_brighten = None
-            if damage_on:
-                dose_patch = _patch_to_out(self._dose_map)
-                thr = float(sp.get("damage_dose_threshold", 3e4))
-                rate = float(sp.get("damage_rate", 1.0))
-                # Gradual contrast loss once cumulative dose exceeds the critical
-                # dose. Use the LOG of the dose ratio so damage progresses smoothly
-                # over many frames (a few % to tens of % per frame) rather than
-                # collapsing the instant the threshold is passed. Real dose can be
-                # >> threshold at small FOV/high dose, so a linear ratio would
-                # saturate immediately; log keeps it controllable and realistic.
-                ratio = np.clip(dose_patch / max(1.0, thr), 1.0, None)
-                excess = np.log10(ratio)                       # 0 at threshold, 1 at 10x
-                self._degradation_factor *= np.exp(-rate * excess).astype(np.float32)
-            if contam_on:
-                contam_patch = _patch_to_out(self._contam_map)
-                # fraction of "full" contamination in [0,1); brightening grows with
-                # accumulated carbon. Applied as an additive HAADF signal increase.
-                contam_frac = 1.0 - np.exp(-0.004 * contam_patch)
-                self._contam_brighten = (contam_frac * 22000.0).astype(np.float32)
-            # Damage reduces electrons pre-noise (correct noise statistics); the
-            # contamination brightening is applied post-normalization below.
-            signal = signal * self._degradation_factor
+            # CONTAMINATION: carbon builds up where the beam dwells, ADDING
+            # projected mass-thickness. HAADF signal scales with mass-thickness,
+            # so contaminated regions get BRIGHTER -> additive brightening.
+            # Applied post-normalization below, because a per-frame normalization
+            # would otherwise cancel it out.
+            contam_patch = _patch_to_out(self._contam_map)
+            # Fraction of "full" contamination in [0,1), saturating exponentially
+            # with accumulated dose. CONTAM_DOSE_SCALE is the characteristic
+            # e-/A^2 for 1/e of saturation; it is what sets "a few frames of
+            # concentrated dwell leaves a visible box".
+            contam_frac = 1.0 - np.exp(-contam_patch / CONTAM_DOSE_SCALE)
+            self._contam_brighten = (contam_frac * 22000.0).astype(np.float32)
         else:
-            self._degradation_factor = None
             self._contam_brighten = None
 
         rng = np.random.default_rng(int(time.time() * 1e6) % (2**32))
@@ -1453,10 +1678,10 @@ class STEMServer(object):
                                       dqe=float(det["dqe"]),
                                       readout_e=float(det["readout_e"]),
                                       rng=rng)
-            # Damage/contamination would be cancelled by naive normalization (a
-            # uniform attenuation rescales away), so we re-apply the degradation
-            # factor AFTER normalization: a degraded region/frame ends up genuinely
-            # darker than a pristine one.
+            # Per-frame normalization for display dynamic range. Contamination
+            # would be cancelled by this (a uniform change rescales away), so it
+            # is applied AFTER normalization: a contaminated region ends up
+            # genuinely brighter than a pristine one.
             # Convert dose counts back to a displayable image. IMPORTANT: use a
             # FIXED reference tied to the dose, not the per-frame max. Per-frame
             # max-normalization stretches a low-contrast (uniform-slab) region's
@@ -1466,8 +1691,6 @@ class STEMServer(object):
             # while real contrast (edges, particles, fringes) still spans the range.
             ref = max(1e-6, dose_e * float(det["dqe"]))   # counts for signal==1.0
             out = np.clip(counts / ref, 0.0, 1.2) * 60000.0
-            if getattr(self, "_degradation_factor", None) is not None:
-                out = out * self._degradation_factor            # damage: darker
             if getattr(self, "_contam_brighten", None) is not None:
                 out = out + self._contam_brighten                # contamination: brighter
             return np.clip(out, 0, 65535).astype(np.uint16)
@@ -1615,12 +1838,10 @@ class STEMServer(object):
         best_score = -1e18; best_z = z0
         for z_m, z_um in zip(zs_m, zs_um):
             self.sim.stage["z"] = float(z_m)
-            # On beam-sensitive specimens, let damage accumulate DURING the sweep
-            # so later Z-steps see a degraded specimen -> the sharpness curve is
-            # corrupted and AF can legitimately diverge (review 3). On robust
-            # specimens (damage disabled) the sweep is non-destructive.
-            damaging = float(self.sim.specimen.get("beam_damage_enabled", 0.0)) >= 0.5
-            img = self._render_camera_image_u16(device, for_autofocus=not damaging)
+            # The AF sweep is non-destructive: contamination is not accumulated
+            # during focus scoring (for_autofocus=True skips the map update), so a
+            # sweep cannot corrupt its own sharpness curve.
+            img = self._render_camera_image_u16(device, for_autofocus=True)
             sc = sharpness_metric(img)
             scores.append((float(z_um), float(sc)))
             if sc > best_score:
@@ -1650,7 +1871,7 @@ class STEMServer(object):
         min_contrast = float(self.sim.specimen.get("af_min_contrast", 0.08))
         if contrast < min_contrast:
             converged = False
-            reason = f"low contrast (peak/floor ratio {contrast:.3f} < {min_contrast:.3f}); specimen may be low-contrast or beam-damaged"
+            reason = f"low contrast (peak/floor ratio {contrast:.3f} < {min_contrast:.3f}); specimen may be low-contrast, too thin, or dose-starved"
         elif near_peak >= 3:
             converged = False
             reason = f"multimodal sharpness curve ({near_peak} comparable maxima); focus ambiguous"
@@ -1673,86 +1894,6 @@ class STEMServer(object):
                                 "z_steps": z_steps, "converged": converged}, result)
         return result
 
-    # ---- simulation environment (review 3): named realism scenarios ----
-    def set_environment(self, name="pristine"):
-        """Configure a bundle of realism settings for a named test scenario.
-        This is the 'simulation environment' a user selects to stress-test their
-        code under specific conditions without changing the specimen itself."""
-        name = str(name).lower().strip()
-        # Drift is specified through the PHYSICAL nm/s interface so presets stay
-        # correct for any sample's volume scale (the notebook hard-coded px/s
-        # values pre-computed for the default scale; nm/s is the same intent,
-        # scale-independent). Realistic anchors: excellent <0.2 · good ~0.5 ·
-        # moderate ~2 · poor ~5 nm/s.
-        presets = {
-            "pristine": {  # ideal conditions: no drift, no damage, high dose
-                "drift": dict(vx_nm_per_s=0.0, vy_nm_per_s=0.0, line_jitter_nm=0.0,
-                              enabled=False),  # ~0 nm/s (excellent)
-                "specimen": dict(beam_damage_enabled=False, contamination_enabled=False),
-                "detector": dict(dwell_us=20.0, dqe=0.9, readout_e=1.0),
-                "af_min_contrast": 0.05,
-            },
-            "beam_sensitive": {  # damage accumulates quickly; AF can diverge
-                "drift": dict(vx_nm_per_s=0.4, vy_nm_per_s=0.25, line_jitter_nm=0.05,
-                              enabled=True),  # ~0.5 nm/s (good)
-                "specimen": dict(beam_damage_enabled=True, contamination_enabled=False,
-                                 damage_dose_threshold=1.0e4, damage_rate=0.8),
-                "detector": dict(dwell_us=10.0, dqe=0.8, readout_e=1.5),
-                "af_min_contrast": 0.12,
-            },
-            "contaminating": {  # carbon builds up where the beam dwells
-                "drift": dict(vx_nm_per_s=1.0, vy_nm_per_s=0.6, line_jitter_nm=0.1,
-                              enabled=True),  # ~1.2 nm/s (moderate)
-                "specimen": dict(beam_damage_enabled=False, contamination_enabled=True,
-                                 contamination_rate=3.0),
-                "detector": dict(dwell_us=15.0, dqe=0.8, readout_e=1.5),
-                "af_min_contrast": 0.10,
-            },
-            "thick_drifting": {  # thick noisy sample with strong drift
-                "drift": dict(vx_nm_per_s=5.0, vy_nm_per_s=3.0, line_jitter_nm=0.3,
-                              enabled=True),  # ~5.8 nm/s (poor/fresh insert)
-                "specimen": dict(beam_damage_enabled=False, contamination_enabled=False),
-                "detector": dict(dwell_us=6.0, dqe=0.7, readout_e=2.5),
-                "af_min_contrast": 0.10,
-            },
-            "low_dose": {  # dose-limited: very noisy, AF struggles
-                "drift": dict(vx_nm_per_s=1.5, vy_nm_per_s=0.9, line_jitter_nm=0.15,
-                              enabled=True),  # ~1.7 nm/s (moderate, dose-limited)
-                "specimen": dict(beam_damage_enabled=True, contamination_enabled=False,
-                                 damage_dose_threshold=5.0e3, damage_rate=1.0),
-                "detector": dict(dwell_us=2.0, dqe=0.75, readout_e=2.0),
-                "af_min_contrast": 0.15,
-            },
-        }
-        if name not in presets:
-            raise ValueError(f"Unknown environment '{name}'. Options: {list(presets.keys())}")
-        cfg = presets[name]
-        self.set_drift(**cfg["drift"], reset_accum=True)
-        self.set_specimen(**cfg["specimen"])
-        for k, v in cfg["detector"].items():
-            self.detectors["haadf"][k] = v
-        self.sim.specimen["af_min_contrast"] = cfg["af_min_contrast"]
-        # Thickness is part of the environment too: some scenarios put you on a
-        # thick region, some on a thin one. Only applied if a sample is loaded.
-        env_thickness = {
-            "thick_drifting": dict(thickness_nm=90.0, thickness_seed=3),
-            "low_dose":       dict(thickness_nm=25.0, thickness_seed=5),
-        }
-        if name in env_thickness and getattr(self, "current_sample", None) is not None:
-            try:
-                self.set_thickness(**env_thickness[name])
-            except Exception:
-                pass
-        self.reset_specimen()
-        self._current_environment = name
-        r = {"environment": name, "config": cfg}
-        self._log("set_environment", {"name": name}, r)
-        return r
-
-    def get_environment(self):
-        return {"environment": getattr(self, "_current_environment", "pristine"),
-                "available": ["pristine","beam_sensitive","contaminating","thick_drifting","low_dose"]}
-
     def get_microscope_state(self):
         """Composite snapshot used by the HTTP session endpoint (one RPC)."""
         st = self.sim.stage
@@ -1768,7 +1909,6 @@ class STEMServer(object):
             # inline (not via get_diffraction_settings) so 2 s polling does not
             # flood the command log
             "diffraction": {k: float(v) for k, v in self.sim.diff.items()},
-            "environment": getattr(self, "_current_environment", "pristine"),
             "sample": {
                 "name": self.current_sample_name,
                 "registered": self.vol is not None,
@@ -1784,18 +1924,16 @@ class STEMServer(object):
             # drift with physical nm/s echo + dose meter fields, so the 2 s poll
             # carries everything the GUI displays without extra RPC loops
             "drift": self._drift_state_with_nm(),
+            # rates included so the GUI's condition widgets can hydrate from
+            # the server state without extra RPC loops
             "specimen": {
-                "beam_damage_enabled": float(self.sim.specimen.get("beam_damage_enabled", 0.0)),
                 "contamination_enabled": float(self.sim.specimen.get("contamination_enabled", 0.0)),
-                "damage_dose_threshold": float(self.sim.specimen.get("damage_dose_threshold", 3e4)),
-                # rates included so the GUI's custom sliders can hydrate from
-                # the server (e.g. after an environment preset sets them)
-                "damage_rate": float(self.sim.specimen.get("damage_rate", 1.0)),
-                "contamination_rate": float(self.sim.specimen.get("contamination_rate", 1.0)),
-                "max_accumulated_dose": (float(self._dose_map.max())
-                                         if self._dose_map is not None else 0.0),
+                "contamination_rate": float(self.sim.specimen.get("contamination_rate", 100.0)),
                 "max_contamination": (float(self._contam_map.max())
                                       if self._contam_map is not None else 0.0),
+            },
+            "autofocus": {
+                "min_contrast": float(self.sim.specimen.get("af_min_contrast", 0.08)),
             },
         }
         return r

@@ -2,8 +2,8 @@
  * API client for the microscope CONTROL surface (/api/microscope).
  *
  * Everything here has a real-instrument counterpart. Twin-only configuration
- * (samples, environments, degradation) lives in simulation.ts — mirroring the
- * backend's control/simulation split.
+ * (samples, acquisition conditions, degradation) lives in simulation.ts —
+ * mirroring the backend's control/simulation split.
  */
 
 import { API_BASE_URL, apiGet, apiPost } from './client';
@@ -79,13 +79,14 @@ export interface DriftStateSnapshot {
 }
 
 export interface SpecimenSnapshot {
-  beam_damage_enabled: number;
   contamination_enabled: number;
-  damage_dose_threshold: number;
-  damage_rate: number;
+  /** Percentage of the calibrated nominal rate: 100 = nominal, 0 = off. */
   contamination_rate: number;
-  max_accumulated_dose: number;
   max_contamination: number;
+}
+
+export interface AutofocusSnapshot {
+  min_contrast: number;
 }
 
 export interface MicroscopeState {
@@ -94,33 +95,16 @@ export interface MicroscopeState {
   vacuum: number;
   status: string;
   holder_type: string;
-  mode: string; // "IMG" | "DIFF" | "EELS"
+  mode: string; // "IMG" | "DIFF"
   detectors: { [device: string]: DetectorSettings };
   diffraction: { [key: string]: number };
-  environment: string;
   sample: SampleStatus;
   stage_limits: StageLimits;
   thickness?: ThicknessState;
   resolution?: ResolutionInfo;
   drift?: DriftStateSnapshot;
   specimen?: SpecimenSnapshot;
-}
-
-export interface SpectrumEdge {
-  label: string;
-  onset_ev: number;
-  Z: number;
-}
-
-export interface SpectrumResult {
-  success: boolean;
-  energy_ev: number[];
-  intensity: number[];
-  edges: SpectrumEdge[];
-  zlp_ev: number;
-  plasmon_ev: number;
-  thickness_nm: number;
-  elements_Z: number[];
+  autofocus?: AutofocusSnapshot;
 }
 
 export interface DiffractionSettingsInfo {
@@ -253,7 +237,7 @@ export function runAutofocus(
   return apiPost('/microscope/autofocus', { device, z_range_um, z_steps });
 }
 
-export function setMode(mode: 'IMG' | 'DIFF' | 'EELS'): Promise<{ success: boolean; mode: string }> {
+export function setMode(mode: 'IMG' | 'DIFF'): Promise<{ success: boolean; mode: string }> {
   return apiPost('/microscope/mode', { mode });
 }
 
@@ -268,18 +252,6 @@ export function setResolution(
   device = 'haadf',
 ): Promise<{ success: boolean } & ResolutionInfo> {
   return apiPost('/microscope/resolution', { resolution_px, device });
-}
-
-/** Single-spot EELS spectrum (structured dummy on the twin). Pass cx_um/cy_um
- *  to park the probe at the stage position; omitted = sample centre (0, 0). */
-export function acquireSpectrum(options: {
-  ev_min?: number;
-  ev_max?: number;
-  n_channels?: number;
-  cx_um?: number;
-  cy_um?: number;
-} = {}): Promise<SpectrumResult> {
-  return apiPost('/microscope/spectrum', options);
 }
 
 export function getDiffractionSettings(): Promise<DiffractionSettingsInfo> {

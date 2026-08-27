@@ -39,12 +39,6 @@ class TestCaptureStore:
         })
         assert name == "diff_fcc_2000kx_1024px"
 
-    def test_auto_name_tags_abtem_engine(self):
-        name = CaptureStore.auto_name({
-            "mode": "DIFF", "sample": "fcc_single_crystal", "engine": "abTEM",
-        })
-        assert "abtem" in name
-
     def test_auto_name_sanitizes_and_falls_back(self):
         assert CaptureStore.auto_name({}) == "capture"
         assert "/" not in CaptureStore.auto_name({"sample": "../evil"})

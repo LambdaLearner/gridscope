@@ -159,6 +159,31 @@ class Sample:
         """Return the crystal lattice for diffraction, or None if amorphous."""
         return self.lattice
 
+    # --- roaming ---------------------------------------------------------
+    # Every sample roams by default: the sampling window may walk off the edge of
+    # the volume instead of hitting a clamp. Two mechanisms:
+    #
+    #   "periodic" (default) -- the volume is one tile of an endlessly repeating
+    #       specimen and the SAMPLER wraps. Costs nothing, needs no cooperation
+    #       from the sample, works for all thirteen. The specimen repeats with
+    #       period generation_range_um.
+    #   "world" -- the sample implements generate_volume_at() over a position
+    #       hash, so the server re-tiles and the specimen never repeats. Requires
+    #       the generator to be a pure function of world position.
+    #
+    # Set supports_roaming = False only for a specimen that is genuinely finite
+    # and where showing its continuation would be a lie.
+    supports_roaming = True
+    roaming_mode = "periodic"
+
+    def generate_volume_at(self, D, H, W, origin_x_px=0.0, origin_y_px=0.0):
+        """Generate the volume for a patch whose top-left is at the given WORLD
+        pixel offset. The default ignores the offset, which is correct for a
+        finite sample: there is only one patch. Roaming samples override this and
+        must be deterministic in world coordinates -- driving back to a place has
+        to reveal the same specimen you left."""
+        return self.generate_volume(D, H, W)
+
     def get_atoms_in_region(self, cx_um, cy_um, half_width_um, depth_nm):
         """
         Default implementation for particle-based samples. If the sample has
@@ -176,7 +201,11 @@ class Sample:
         shifted = []
         for part in self._particles:
             pz, py, px = part["center_vox"]
-            shifted.append({"center_vox": (pz, py - H/2.0, px - W/2.0),
+            # Centre ALL THREE axes on the volume centre. z used to be passed
+            # through un-centred, which was harmless only while every particle
+            # sat on the mid-plane; once particles are distributed through the
+            # slab it would offset the whole ensemble by half a specimen.
+            shifted.append({"center_vox": (pz - D/2.0, py - H/2.0, px - W/2.0),
                             "radii_vox": part["radii_vox"]})
         amorphous = not getattr(self, "crystalline_particles", True)
         return atoms_in_particles(
@@ -411,6 +440,12 @@ def atoms_in_particles(particles, cx_um, cy_um, half_width_um, depth_nm,
         Rz_A = rz * fill_A_per_vox
         ox_A = rel_x * disp_A_per_vox
         oy_A = rel_y * disp_A_per_vox
+        # DEPTH of the particle. Previously dropped, so every particle was
+        # built on z = 0 no matter where it sat in the slab: the imaging path
+        # and the diffraction / abTEM path described different specimens. Uses
+        # the FILLING scale, the same one that sets Rz_A, so a particle's
+        # offset and its own z extent stay in one consistent unit.
+        oz_A = cz * fill_A_per_vox
 
         if amorphous:
             vol_A3 = (4.0/3.0) * np.pi * Rx_A * Ry_A * Rz_A
@@ -420,7 +455,8 @@ def atoms_in_particles(particles, cx_um, cy_um, half_width_um, depth_nm,
             radii_frac = rng.uniform(0, 1, size=(n_at*2,)) ** (1.0/3.0)
             pts = (u * radii_frac[:, None])[:n_at]
             pts_A = pts * np.array([Rx_A, Ry_A, Rz_A])
-            pos = np.stack([pts_A[:,0] + ox_A, pts_A[:,1] + oy_A, pts_A[:,2]], axis=1)
+            pos = np.stack([pts_A[:,0] + ox_A, pts_A[:,1] + oy_A,
+                            pts_A[:,2] + oz_A], axis=1)
             Z = np.full(len(pos), 79, dtype=np.int32)
         else:
             bp, bZ = tile_lattice_in_region(lattice,
@@ -437,7 +473,7 @@ def atoms_in_particles(particles, cx_um, cy_um, half_width_um, depth_nm,
             ez = bp[:,2] / (Rz_A + 1e-6)
             inside = (ex*ex + ey*ey + ez*ez) <= 1.0
             bp = bp[inside]; bZ = bZ[inside]
-            bp = bp + np.array([ox_A, oy_A, 0.0])
+            bp = bp + np.array([ox_A, oy_A, oz_A])
             pos = bp; Z = bZ
 
         all_pos.append(pos)

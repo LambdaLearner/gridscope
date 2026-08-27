@@ -68,9 +68,9 @@ mic.set_beam(bs: Dict[str, float], relative: bool = False) -> Dict
 mic.get_optics() -> Dict
 mic.set_optics(cs_mm=..., aperture_probe_px=...) -> Dict
 
-# --- Mode (IMG / DIFF / EELS) ---
-mic.get_mode() -> Dict            # {"mode": "IMG"|"DIFF"|"EELS"}
-mic.set_mode(mode: str) -> Dict   # "IMG", "DIFF", or "EELS"
+# --- Mode (IMG / DIFF) ---
+mic.get_mode() -> Dict            # {"mode": "IMG"|"DIFF"}
+mic.set_mode(mode: str) -> Dict   # "IMG" or "DIFF"
 
 # --- Acquisition resolution windows (discrete, like a real scan generator) ---
 mic.get_resolution(device="haadf") -> Dict
@@ -92,19 +92,13 @@ mic.acquire_image(device: str) -> np.ndarray
     # uint16 frame (image in IMG mode, diffraction pattern in DIFF mode).
     # Diffraction frames may take 1-5 s to compute on the twin.
 
-# --- EELS spectrum acquisition (single-spot; probe parked at one position) ---
-mic.acquire_spectrum(ev_min=0.0, ev_max=1000.0, n_channels=1024,
-                     cx_um=None, cy_um=None) -> Dict
-    # {"energy_ev": [...], "intensity": [...],
-    #  "edges": [{"label": "Fe-L", "onset_ev": 708, "Z": 26}, ...],
-    #  "plasmon_ev": float, "thickness_nm": float, "elements_Z": [...]}
-    # Core-loss edges reflect the elements actually under the probe.
-
 # --- Autofocus (CAN FAIL) ---
 mic.autofocus(device="haadf", z_range_um=2.0, z_steps=9) -> Dict
     # {"converged": bool, "reason": str, "best_z_m": float,
     #  "best_z_um_relative": float, "scores": [[z_um, score], ...]}
     # If converged is False the stage Z was NOT moved. Check it.
+mic.set_autofocus_limits(min_contrast: float) -> Dict
+    # Peak/floor contrast ratio below which autofocus reports non-convergence.
 
 # --- Full state snapshot ---
 mic.get_microscope_state() -> Dict

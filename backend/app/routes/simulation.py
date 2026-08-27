@@ -1,10 +1,15 @@
 """SIMULATION routes — twin-only configuration with no real-HW counterpart.
 
 The Sample Settings window talks exclusively to this router: sample registry
-and registration, simulation environments, specimen degradation, and drift
-injection. Keeping these off the /microscope surface preserves the
-"test here, deploy there" boundary: generated automation scripts never
-reference anything served here.
+and registration, acquisition conditions (drift, contamination, detector
+noise, autofocus limits), and specimen reset. Keeping these off the
+/microscope surface preserves the "test here, deploy there" boundary:
+generated automation scripts never reference anything served here.
+
+There are no environment presets. A session states its conditions as numbers
+through the explicit setters below; GET /limits publishes the bounds the
+widgets enforce (and this layer re-enforces with 422s, since the twin server
+itself validates almost nothing).
 """
 
 from typing import Any, Dict, Optional
@@ -12,15 +17,21 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter
 from pydantic import BaseModel, Field, model_validator
 
+from ..digital_twin import limits
 from ..digital_twin.limits import (
-    CONTAMINATION_MAX_RATE,
-    DAMAGE_DOSE_THRESHOLD_MAX,
-    DAMAGE_DOSE_THRESHOLD_MIN,
-    DAMAGE_MAX_RATE,
+    AF_MIN_CONTRAST_MAX,
+    AF_MIN_CONTRAST_MIN,
+    CONTAMINATION_MAX_RATE_PCT,
+    DRIFT_MAX_DT_S,
     DRIFT_MAX_JITTER_NM,
     DRIFT_MAX_NM_PER_S,
+    NOISE_DQE_MAX,
+    NOISE_DQE_MIN,
+    NOISE_DWELL_US_MAX,
+    NOISE_DWELL_US_MIN,
+    NOISE_READOUT_E_MAX,
+    NOISE_SIGMA_MAX,
 )
-from ..services import abtem_service
 from ..services import twin_session as ts
 
 router = APIRouter(prefix="/simulation", tags=["simulation"])
@@ -41,7 +52,6 @@ MAX_SEED = 2**31 - 1
 class RegisterSampleRequest(BaseModel):
     name: str
     params: Dict[str, Any] = Field(default_factory=dict)
-    environment: Optional[str] = None
     # Volume resolution; defaults match the twin's canonical sizes.
     D: Optional[int] = Field(None, ge=1, le=MAX_VOLUME_D)
     H: Optional[int] = Field(None, ge=32, le=MAX_VOLUME_HW)
@@ -61,25 +71,29 @@ class RegisterSampleRequest(BaseModel):
         return self
 
 
-class SetEnvironmentRequest(BaseModel):
-    name: str
+class ContaminationSettings(BaseModel):
+    # `rate` is a percentage of the calibrated nominal rate: 100 = nominal,
+    # 200 = twice as fast, 0 = off.
+    enabled: Optional[bool] = None
+    rate: Optional[float] = Field(None, ge=0.0, le=CONTAMINATION_MAX_RATE_PCT)
 
 
-class SpecimenSettings(BaseModel):
-    # Bounds live in digital_twin/limits.py (shared with the twin and
-    # mirrored by the frontend sliders). Scripts hit this surface too, so
-    # an absurd rate must 422 here, not render garbage.
-    beam_damage_enabled: Optional[bool] = None
-    damage_dose_threshold: Optional[float] = Field(
-        None, ge=DAMAGE_DOSE_THRESHOLD_MIN, le=DAMAGE_DOSE_THRESHOLD_MAX)
-    damage_rate: Optional[float] = Field(None, ge=0.0, le=DAMAGE_MAX_RATE)
-    contamination_enabled: Optional[bool] = None
-    contamination_rate: Optional[float] = Field(
-        None, ge=0.0, le=CONTAMINATION_MAX_RATE)
+class NoiseSettings(BaseModel):
+    dwell_us: Optional[float] = Field(
+        None, ge=NOISE_DWELL_US_MIN, le=NOISE_DWELL_US_MAX)
+    dqe: Optional[float] = Field(None, ge=NOISE_DQE_MIN, le=NOISE_DQE_MAX)
+    readout_e: Optional[float] = Field(None, ge=0.0, le=NOISE_READOUT_E_MAX)
+    use_dose_model: Optional[bool] = None
+    noise_sigma: Optional[float] = Field(None, ge=0.0, le=NOISE_SIGMA_MAX)
+
+
+class AutofocusLimitsSettings(BaseModel):
+    min_contrast: Optional[float] = Field(
+        None, ge=AF_MIN_CONTRAST_MIN, le=AF_MIN_CONTRAST_MAX)
 
 
 class DriftSettings(BaseModel):
-    # Physical interface (preferred): TEM-realistic drift is 0-10 nm/s;
+    # Physical interface (preferred): TEM-realistic drift is 0.1-5 nm/s;
     # the cap leaves headroom for stress tests without allowing absurdity.
     vx_nm_per_s: Optional[float] = Field(None, ge=0.0, le=DRIFT_MAX_NM_PER_S)
     vy_nm_per_s: Optional[float] = Field(None, ge=0.0, le=DRIFT_MAX_NM_PER_S)
@@ -89,6 +103,9 @@ class DriftSettings(BaseModel):
     vx_px_per_s: Optional[float] = Field(None, ge=0.0, le=50.0)
     vy_px_per_s: Optional[float] = Field(None, ge=0.0, le=50.0)
     line_jitter_px: Optional[float] = Field(None, ge=0.0, le=5.0)
+    # Per-frame elapsed-time cap (idle-jump guard); raise for a deliberate
+    # long-gap drift study.
+    max_dt_s: Optional[float] = Field(None, ge=0.0, le=DRIFT_MAX_DT_S)
     enabled: Optional[bool] = None
     reset_accum: bool = False
 
@@ -98,18 +115,15 @@ class SetThicknessRequest(BaseModel):
     thickness_seed: Optional[int] = Field(None, ge=0, le=MAX_SEED)
 
 
-class AbtemDiffractionRequest(BaseModel):
-    # >0 adds thermal-diffuse background; each config multiplies runtime.
-    num_frozen_phonons: int = Field(0, ge=0, le=abtem_service.MAX_FROZEN_PHONONS)
-    half_width_um: float = Field(0.02, gt=0.0, le=1.0)
-    depth_nm: float = Field(10.0, gt=0.0, le=200.0)
-    # Extraction box; the service also enforces its own hard maxima.
-    max_lateral_A: float = Field(50.0, gt=0.0, le=abtem_service.MAX_LATERAL_A)
-    max_thickness_A: float = Field(80.0, gt=0.0, le=abtem_service.MAX_THICKNESS_A)
-    max_angle_mrad: float = Field(60.0, ge=10.0, le=120.0)
-
-
 # ===== Endpoints =====
+
+@router.get("/limits")
+def get_limits():
+    """Bounds for every free-form acquisition-condition field. The frontend
+    fetches this at connect time for widget ranges and pre-RPC clamping;
+    src/api/limits.ts holds offline fallbacks only."""
+    return limits.as_dict()
+
 
 @router.get("/samples")
 def list_samples():
@@ -128,8 +142,9 @@ def get_current_sample():
 @router.post("/sample/register")
 def register_sample(request: RegisterSampleRequest):
     """Register a sample: loads it into the twin as the active specimen and
-    resets degradation history (fresh specimen). Optionally applies a
-    simulation environment in the same step."""
+    resets degradation history (fresh specimen). Acquisition conditions are
+    independent of registration — set them via /drift, /contamination,
+    /noise, and /autofocus-limits."""
     ts.require_idle()
     harness = ts.get_harness()
     result = ts.twin_call(
@@ -141,17 +156,12 @@ def register_sample(request: RegisterSampleRequest):
         thickness_seed=request.thickness_seed,
     )
     ts.twin_call(harness.reset_specimen)
-    environment = None
-    if request.environment:
-        env_result = ts.twin_call(harness.set_environment, request.environment)
-        environment = env_result.get("environment")
     return {
         "success": True,
         "registered": result.get("loaded"),
         "shape": result.get("shape"),
         "params": result.get("params"),
         "thickness": result.get("thickness"),
-        "environment": environment,
     }
 
 
@@ -176,57 +186,41 @@ def set_thickness(request: SetThicknessRequest):
     return {"success": True, **result}
 
 
-@router.get("/environment")
-def get_environment():
-    return ts.twin_call(ts.get_harness().get_environment)
-
-
-@router.post("/environment")
-def set_environment(request: SetEnvironmentRequest):
-    ts.require_idle()
-    result = ts.twin_call(ts.get_harness().set_environment, request.name)
-    return {"success": True, **result}
-
-
 @router.get("/specimen")
 def get_specimen():
     return ts.twin_call(ts.get_harness().get_specimen)
 
 
-@router.post("/specimen")
-def set_specimen(settings: SpecimenSettings):
+@router.post("/contamination")
+def set_contamination(settings: ContaminationSettings):
+    ts.require_idle()
+    return {"success": True, **ts.twin_call(
+        lambda: ts.get_harness().set_contamination(
+            enabled=settings.enabled, rate=settings.rate))}
+
+
+@router.post("/noise")
+def set_noise(settings: NoiseSettings):
+    """Detector / dose parameters. NOTE: writes only the keys you pass —
+    an omitted key keeps its current server-side value."""
     ts.require_idle()
     kwargs = {k: v for k, v in settings.model_dump().items() if v is not None}
-    return {"success": True, **ts.twin_call(lambda: ts.get_harness().set_specimen(**kwargs))}
+    return {"success": True, **ts.twin_call(
+        lambda: ts.get_harness().set_noise(**kwargs))}
+
+
+@router.post("/autofocus-limits")
+def set_autofocus_limits(settings: AutofocusLimitsSettings):
+    ts.require_idle()
+    return {"success": True, **ts.twin_call(
+        lambda: ts.get_control().set_autofocus_limits(
+            min_contrast=settings.min_contrast))}
 
 
 @router.post("/specimen/reset")
 def reset_specimen():
     ts.require_idle()
     return {"success": True, **ts.twin_call(ts.get_harness().reset_specimen)}
-
-
-@router.get("/diffraction/abtem/availability")
-def abtem_availability():
-    """Whether the optional abtem/ase dependencies are installed. The UI greys
-    the Kinematical⇄abTEM toggle when unavailable."""
-    return abtem_service.availability()
-
-
-@router.post("/diffraction/abtem")
-def compute_abtem_diffraction(request: AbtemDiffractionRequest):
-    """Compute a dynamical (multislice) SAED pattern for the registered sample
-    at the current stage tilt and beam voltage. Long-running (seconds to tens
-    of seconds); one computation at a time (409 while busy); 501 when abtem is
-    not installed. Results are cached on the full state fingerprint."""
-    return abtem_service.compute_saed(
-        num_frozen_phonons=request.num_frozen_phonons,
-        half_width_um=request.half_width_um,
-        depth_nm=request.depth_nm,
-        max_lateral_A=request.max_lateral_A,
-        max_thickness_A=request.max_thickness_A,
-        max_angle_mrad=request.max_angle_mrad,
-    )
 
 
 @router.get("/drift")

@@ -2,15 +2,16 @@
 sim_harness.py — twin-only test-harness configuration.
 
 NONE of these methods has a real-instrument counterpart: they choose the
-specimen, set the simulation environment, and inject drift / beam damage /
-contamination. A real deployment has no SimulationHarness. Generated
-automation scripts must never use this class.
+specimen and inject acquisition conditions (drift, contamination, detector
+noise). A real deployment has no SimulationHarness. Generated automation
+scripts must never use this class.
 """
 
 
 class SimulationHarness:
-    """Twin-only configuration: choose the specimen, set the environment, inject
-    drift / beam damage / contamination. A real deployment has no equivalent.
+    """Twin-only configuration: choose the specimen and inject acquisition
+    conditions (drift / contamination / noise). A real deployment has no
+    equivalent.
 
     Wraps a MicroscopeControlClient and reuses its connection for the twin's
     simulation commands. Access the control surface via `.control`."""
@@ -45,14 +46,26 @@ class SimulationHarness:
         if thickness_seed is not None: p["thickness_seed"] = thickness_seed
         return self._call("set_thickness", p)
 
-    # ---- simulation environment (named realism scenarios) ----
-    def set_environment(self, name="pristine"): return self._call("set_environment", {"name": name})
-    def get_environment(self): return self._call("get_environment")
-
-    # ---- specimen degradation (beam damage + contamination) ----
+    # ---- specimen degradation (contamination) ----
     def get_specimen(self): return self._call("get_specimen")
-    def set_specimen(self, **kw): return self._call("set_specimen", kw)
     def reset_specimen(self): return self._call("reset_specimen")
+
+    # Contamination: carbon accumulating where the beam dwells. `rate` is a
+    # percentage knob -- 100 is the calibrated nominal rate, 0 is off.
+    def set_contamination(self, enabled=None, rate=None):
+        p = {}
+        if enabled is not None: p["enabled"] = enabled
+        if rate is not None: p["rate"] = rate
+        return self._call("set_contamination", p)
+
+    # ---- detector / dose noise (everything governing how noisy a frame is) ----
+    def set_noise(self, dwell_us=None, dqe=None, readout_e=None,
+                  use_dose_model=None, noise_sigma=None, device="haadf"):
+        p = {"device": device}
+        for k, v in (("dwell_us", dwell_us), ("dqe", dqe), ("readout_e", readout_e),
+                     ("use_dose_model", use_dose_model), ("noise_sigma", noise_sigma)):
+            if v is not None: p[k] = v
+        return self._call("set_noise", p)
 
     # ---- mechanical drift injection ----
     def get_drift(self): return self._call("get_drift")

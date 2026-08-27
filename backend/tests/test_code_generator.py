@@ -40,8 +40,8 @@ class TestEmbeddedControlClient:
             assert method in CONTROL_CLIENT_CODE, f"Missing: {method}"
 
     def test_code_has_no_simulation_surface(self):
-        for forbidden in ["SimulationHarness", "load_sample", "set_environment",
-                          "set_drift", "set_specimen"]:
+        for forbidden in ["SimulationHarness", "load_sample", "set_contamination",
+                          "set_noise", "set_drift", "set_thickness"]:
             assert forbidden not in CONTROL_CLIENT_CODE, f"Found: {forbidden}"
 
     def test_code_compiles(self):
@@ -96,8 +96,9 @@ class TestGeneratedScript:
         assert '"field_of_view_um": 12.5' in code
 
     def test_template_has_no_simulation_calls(self):
-        for forbidden in ["load_sample", "set_environment", "set_drift",
-                          "set_specimen", "reset_specimen", "STEMClient"]:
+        for forbidden in ["load_sample", "set_contamination", "set_noise",
+                          "set_drift", "set_thickness", "reset_specimen",
+                          "STEMClient"]:
             assert forbidden not in DIGITAL_TWIN_TEMPLATE, f"Found: {forbidden}"
 
 

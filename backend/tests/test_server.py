@@ -1,9 +1,10 @@
 """Unit tests for the v6 STEMServer — direct class-level tests (no sockets).
 
 Covers the safety-critical core: stage soft limits (boundary-exact cases per
-axis), the sample registration gate, the full sample registry, simulation
-environments, magnification/FOV coupling, autofocus convergence reporting,
-and specimen-volume release across registrations.
+axis), the sample registration gate, the full sample registry, acquisition
+conditions (contamination / noise / drift / autofocus limits),
+magnification/FOV coupling, autofocus convergence reporting, and
+specimen-volume release across registrations.
 """
 
 import gc
@@ -245,34 +246,6 @@ class TestMagnificationFov:
 
 
 # ---------------------------------------------------------------------------
-# Environments
-# ---------------------------------------------------------------------------
-class TestEnvironments:
-    ALL = ["pristine", "beam_sensitive", "contaminating", "thick_drifting", "low_dose"]
-
-    @pytest.mark.parametrize("name", ALL)
-    def test_environment_applies(self, server, name):
-        r = server.set_environment(name)
-        assert r["environment"] == name
-        assert server.get_environment()["environment"] == name
-
-    def test_available_list_matches(self, server):
-        assert server.get_environment()["available"] == self.ALL
-
-    def test_unknown_environment_raises(self, server):
-        with pytest.raises(ValueError, match="Unknown environment"):
-            server.set_environment("perfect_vacuum")
-
-    def test_environment_resets_specimen_history(self, server):
-        server.set_environment("beam_sensitive")
-        for _ in range(3):
-            server.acquire_image("haadf")
-        assert server.get_specimen()["max_accumulated_dose"] > 0
-        server.set_environment("pristine")
-        assert server.get_specimen()["max_accumulated_dose"] == 0
-
-
-# ---------------------------------------------------------------------------
 # Mode and autofocus
 # ---------------------------------------------------------------------------
 class TestModeAndAutofocus:
@@ -287,7 +260,12 @@ class TestModeAndAutofocus:
         assert server.get_mode()["mode"] == "IMG"
 
     def test_autofocus_reports_convergence_fields(self, server):
-        server.set_environment("pristine")
+        server.set_drift(vx_nm_per_s=0.0, vy_nm_per_s=0.0, line_jitter_nm=0.0,
+                         enabled=False, reset_accum=True)
+        server.set_contamination(enabled=False)
+        server.set_noise(dwell_us=20.0, dqe=0.9, readout_e=1.0)
+        server.set_autofocus_limits(min_contrast=0.05)
+        server.reset_specimen()
         server.set_mode("IMG")
         r = server.autofocus("haadf", z_range_um=2.0, z_steps=5)
         assert set(r) >= {"converged", "reason", "best_z_m",
@@ -393,6 +371,14 @@ class TestThicknessWorkflow:
         thin = _decode_u16(fresh_server.acquire_image("haadf")).mean()
         assert thin < thick
 
+    def test_state_snapshot_includes_thickness_and_resolution(self, fresh_server):
+        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W,
+                                 thickness_nm=40.0)
+        state = fresh_server.get_microscope_state()
+        assert state["thickness"]["working_nm"] == pytest.approx(40.0)
+        assert state["resolution"]["resolution_px"] in (1024, 2048, 4096)
+        assert state["resolution"]["allowed"] == [1024, 2048, 4096]
+
 
 # ---------------------------------------------------------------------------
 # Resolution windows (discrete 1024/2048/4096)
@@ -422,90 +408,6 @@ class TestResolutionWindows:
         with pytest.raises(ValueError):
             fresh_server.set_resolution(999)
         assert fresh_server.get_resolution()["resolution_px"] == before
-
-
-# ---------------------------------------------------------------------------
-# EELS mode + single-spot spectrum
-# ---------------------------------------------------------------------------
-class TestEELS:
-    def test_eels_mode_accepted(self, fresh_server):
-        assert fresh_server.set_mode("EELS")["mode"] == "EELS"
-        assert fresh_server.get_mode()["mode"] == "EELS"
-
-    def test_acquire_spectrum_without_sample_raises_no_sample(self, fresh_server):
-        with pytest.raises(RuntimeError, match="No sample registered"):
-            fresh_server.acquire_spectrum()
-
-    def test_spectrum_shape_and_range(self, fresh_server):
-        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        r = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=1000.0, n_channels=512)
-        assert len(r["energy_ev"]) == 512
-        assert len(r["intensity"]) == 512
-        assert r["energy_ev"][0] == pytest.approx(0.0)
-        assert r["energy_ev"][-1] == pytest.approx(1000.0)
-        assert min(r["intensity"]) >= 0.0
-
-    def test_fe_sample_shows_fe_edge(self, fresh_server):
-        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        r = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=1000.0)
-        labels = [e["label"] for e in r["edges"]]
-        assert "Fe-L" in labels
-        assert 26 in r["elements_Z"]
-
-    def test_au_sample_shows_au_edge_in_extended_range(self, fresh_server):
-        fresh_server.load_sample("au_dispersed", D=D, H=H, W=W)
-        r = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=2500.0)
-        labels = [e["label"] for e in r["edges"]]
-        assert "Au-M" in labels
-
-    def test_edges_outside_range_omitted(self, fresh_server):
-        fresh_server.load_sample("au_dispersed", D=D, H=H, W=W)
-        r = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=500.0)
-        labels = [e["label"] for e in r["edges"]]
-        assert "Au-M" not in labels   # Au-M onset 2206 eV > 500 eV
-
-    def test_plasmon_scales_with_working_thickness(self, fresh_server):
-        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        fresh_server.set_thickness(thickness_nm=100.0)
-        thick = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=60.0, n_channels=600)
-        fresh_server.set_thickness(thickness_nm=10.0)
-        thin = fresh_server.acquire_spectrum(ev_min=0.0, ev_max=60.0, n_channels=600)
-        ep = thick["plasmon_ev"]
-        idx = int(round(ep / 60.0 * 599))
-        assert thick["intensity"][idx] > thin["intensity"][idx]
-
-
-# ---------------------------------------------------------------------------
-# Environments now carry a thickness component
-# ---------------------------------------------------------------------------
-class TestEnvironmentThickness:
-    def test_thick_drifting_sets_90nm(self, fresh_server):
-        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        fresh_server.set_environment("thick_drifting")
-        assert fresh_server.get_thickness()["working_nm"] == pytest.approx(90.0)
-
-    def test_low_dose_sets_25nm(self, fresh_server):
-        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        fresh_server.set_environment("low_dose")
-        assert fresh_server.get_thickness()["working_nm"] == pytest.approx(25.0)
-
-    def test_pristine_leaves_thickness_alone(self, fresh_server):
-        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W,
-                                 thickness_nm=33.0)
-        fresh_server.set_environment("pristine")
-        assert fresh_server.get_thickness()["working_nm"] == pytest.approx(33.0)
-
-    def test_environment_without_sample_does_not_crash(self, fresh_server):
-        r = fresh_server.set_environment("thick_drifting")
-        assert r["environment"] == "thick_drifting"
-
-    def test_state_snapshot_includes_thickness_and_resolution(self, fresh_server):
-        fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W,
-                                 thickness_nm=40.0)
-        state = fresh_server.get_microscope_state()
-        assert state["thickness"]["working_nm"] == pytest.approx(40.0)
-        assert state["resolution"]["resolution_px"] in (1024, 2048, 4096)
-        assert state["resolution"]["allowed"] == [1024, 2048, 4096]
 
 
 # ---------------------------------------------------------------------------
@@ -644,7 +546,7 @@ class TestRegistryContract:
 
 
 # ---------------------------------------------------------------------------
-# v2 realism package: physical drift units, idle-jump guard, real-dose damage
+# v2 realism package: physical drift units, idle-jump guard, real-dose exposure
 # ---------------------------------------------------------------------------
 class TestPhysicalDrift:
     def test_nm_per_s_converts_via_volume_scale(self, fresh_server):
@@ -685,25 +587,28 @@ class TestPhysicalDrift:
         fresh_server.set_drift(vx_nm_per_s=1.0, enabled=True)
         state = fresh_server.get_microscope_state()
         assert state["drift"]["vx_nm_per_s"] == pytest.approx(1.0)
-        assert "max_accumulated_dose" in state["specimen"]
-        assert "damage_dose_threshold" in state["specimen"]
+        assert "max_contamination" in state["specimen"]
+        assert "max_accumulated_dose" not in state["specimen"]
+        assert "min_contrast" in state["autofocus"]
+        assert "environment" not in state
 
 
 class TestRealDose:
-    def _dose_after_one_frame(self, srv, fov_um, resolution_px):
-        srv.set_specimen(beam_damage_enabled=True)
-        srv._dose_map = None
-        srv._ensure_specimen_maps()
+    def _contamination_after_one_frame(self, srv, fov_um, resolution_px):
+        srv.set_contamination(enabled=True, rate=100.0)
+        srv.reset_specimen()
         srv.device_settings("haadf", field_of_view_um=fov_um, size=resolution_px)
         srv.acquire_image("haadf")
-        return float(srv._dose_map.max())
+        return float(srv.get_specimen()["max_contamination"])
 
     def test_dose_is_real_electrons_per_A2(self, fresh_server):
-        """dose = (I*t/e)/pixel_area with pixel_area=(FOV/res)^2."""
+        """accumulation = dose * rate/100, dose = (I*t/e)/pixel_area with
+        pixel_area=(FOV/res)^2; at rate=100 the map holds the dose itself."""
         fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
         fresh_server.set_beam({"current_pA": 80.0}, relative=False)
         fresh_server.device_settings("haadf", dwell_us=20.0)
-        dose = self._dose_after_one_frame(fresh_server, fov_um=1.0, resolution_px=1024)
+        dose = self._contamination_after_one_frame(fresh_server, fov_um=1.0,
+                                                   resolution_px=1024)
         e_per_px = (80.0e-12 / 1.602e-19) * 20e-6
         pix_A2 = ((1.0 * 1000.0 / 1024) * 10.0) ** 2
         assert dose == pytest.approx(e_per_px / pix_A2, rel=1e-3)
@@ -711,54 +616,102 @@ class TestRealDose:
     def test_higher_resolution_concentrates_dose(self, fresh_server):
         """Same FOV, 1024 -> 2048 px: 4x smaller pixel area, 4x the dose."""
         fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        d1024 = self._dose_after_one_frame(fresh_server, fov_um=2.0, resolution_px=1024)
-        d2048 = self._dose_after_one_frame(fresh_server, fov_um=2.0, resolution_px=2048)
+        d1024 = self._contamination_after_one_frame(fresh_server, fov_um=2.0,
+                                                    resolution_px=1024)
+        d2048 = self._contamination_after_one_frame(fresh_server, fov_um=2.0,
+                                                    resolution_px=2048)
         assert d2048 == pytest.approx(4.0 * d1024, rel=1e-3)
 
     def test_smaller_fov_concentrates_dose(self, fresh_server):
         fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        d_wide = self._dose_after_one_frame(fresh_server, fov_um=4.0, resolution_px=1024)
-        d_narrow = self._dose_after_one_frame(fresh_server, fov_um=1.0, resolution_px=1024)
+        d_wide = self._contamination_after_one_frame(fresh_server, fov_um=4.0,
+                                                     resolution_px=1024)
+        d_narrow = self._contamination_after_one_frame(fresh_server, fov_um=1.0,
+                                                       resolution_px=1024)
         assert d_narrow == pytest.approx(16.0 * d_wide, rel=1e-3)
 
-    def test_damage_is_gradual_log_progression(self, fresh_server):
-        """At 10x the critical dose, one frame loses exp(-rate) contrast --
-        gradual -- instead of the old linear collapse (exp(-9))."""
+
+# ---------------------------------------------------------------------------
+# v5 acquisition-condition setters (contamination / noise / autofocus / drift)
+# ---------------------------------------------------------------------------
+class TestConditionSetters:
+    def test_set_contamination_roundtrip(self, fresh_server):
         fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        fresh_server.set_specimen(beam_damage_enabled=True,
-                                  damage_dose_threshold=100.0, damage_rate=1.0)
-        fresh_server._ensure_specimen_maps()
-        fresh_server._dose_map[:] = 1000.0   # 10x threshold everywhere
+        r = fresh_server.set_contamination(enabled=True, rate=250.0)
+        assert r["contamination_rate"] == pytest.approx(250.0)
+        assert r["contamination_enabled"] == 1.0
+        r = fresh_server.set_contamination(enabled=False)
+        assert r["contamination_enabled"] == 0.0
+        # rate=0 is "off" even while enabled: nothing accumulates
+        fresh_server.set_contamination(enabled=True, rate=0.0)
+        fresh_server.reset_specimen()
         fresh_server.acquire_image("haadf")
-        factor = float(fresh_server._degradation_factor.mean())
-        assert factor == pytest.approx(np.exp(-1.0), rel=0.05), (
-            "log progression: 10x over-dose should cost exp(-rate), not collapse")
+        assert fresh_server.get_specimen()["max_contamination"] == 0.0
 
-    def test_default_threshold_is_moderately_robust(self, fresh_server):
-        assert fresh_server.get_specimen()["damage_dose_threshold"] == pytest.approx(3.0e4)
-
-
-class TestRetunedPresets:
-    @pytest.mark.parametrize("env,expected_nm", [
-        ("pristine", 0.0),
-        ("beam_sensitive", 0.4),
-        ("contaminating", 1.0),
-        ("thick_drifting", 5.0),
-        ("low_dose", 1.5),
-    ])
-    def test_preset_drift_is_realistic_nm_per_s(self, fresh_server, env, expected_nm):
+    def test_contamination_rate_is_a_percentage_of_nominal(self, fresh_server):
+        # Accumulation is deterministic (the image noise is not), so a single
+        # frame at rate=200 must land at exactly 2x the rate=100 map max.
         fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        fresh_server.set_environment(env)
-        d = fresh_server._drift_state_with_nm()
-        assert d["vx_nm_per_s"] == pytest.approx(expected_nm, abs=1e-6)
+        fresh_server.set_contamination(enabled=True, rate=100.0)
+        fresh_server.reset_specimen()
+        fresh_server.acquire_image("haadf")
+        at_100 = fresh_server.get_specimen()["max_contamination"]
+        fresh_server.set_contamination(rate=200.0)
+        fresh_server.reset_specimen()
+        fresh_server.acquire_image("haadf")
+        at_200 = fresh_server.get_specimen()["max_contamination"]
+        assert at_100 > 0.0
+        assert at_200 == pytest.approx(2.0 * at_100, rel=1e-6)
 
-    def test_preset_thresholds_retuned(self, fresh_server):
+    def test_set_noise_writes_only_the_keys_passed(self, fresh_server):
+        # Partial-update trap: a later call touching another key must NOT
+        # reset earlier settings to defaults (the project's worst historical
+        # defect was exactly this leak).
+        fresh_server.set_noise(dwell_us=5.0)
+        fresh_server.set_noise(dqe=0.5)
+        det = fresh_server.detectors["haadf"]
+        assert det["dwell_us"] == pytest.approx(5.0)
+        assert det["dqe"] == pytest.approx(0.5)
+
+    def test_set_autofocus_limits_roundtrip_and_enforcement(self, fresh_server):
+        r = fresh_server.set_autofocus_limits(min_contrast=0.2)
+        assert r["af_min_contrast"] == pytest.approx(0.2)
+        # An absurdly strict threshold must make autofocus refuse to converge.
         fresh_server.load_sample("fcc_single_crystal", D=D, H=H, W=W)
-        fresh_server.set_environment("beam_sensitive")
-        assert fresh_server.get_specimen()["damage_dose_threshold"] == pytest.approx(1.0e4)
-        assert fresh_server.get_specimen()["damage_rate"] == pytest.approx(0.8)
-        fresh_server.set_environment("low_dose")
-        assert fresh_server.get_specimen()["damage_dose_threshold"] == pytest.approx(5.0e3)
+        fresh_server.set_autofocus_limits(min_contrast=0.999)
+        af = fresh_server.autofocus("haadf", z_range_um=2.0, z_steps=5)
+        assert af["converged"] is False
+        assert "low contrast" in af["reason"]
+
+    def test_set_drift_max_dt_roundtrip(self, fresh_server):
+        fresh_server.set_drift(max_dt_s=120.0)
+        assert fresh_server.get_drift()["max_dt_s"] == pytest.approx(120.0)
+
+
+# ---------------------------------------------------------------------------
+# v5 removed surface: environments / specimen presets / EELS are gone
+# ---------------------------------------------------------------------------
+class TestRemovedSurface:
+    @pytest.mark.parametrize("name", ["set_environment", "get_environment",
+                                      "set_specimen", "acquire_spectrum"])
+    def test_removed_rpcs_are_gone(self, fresh_server, name):
+        assert not hasattr(fresh_server, name)
+
+    def test_eels_mode_rejected(self, fresh_server):
+        with pytest.raises(ValueError, match="IMG"):
+            fresh_server.set_mode("EELS")
+
+    def test_harness_surface_is_current(self):
+        from app.digital_twin.sim_harness import SimulationHarness
+        assert not hasattr(SimulationHarness, "set_environment")
+        assert not hasattr(SimulationHarness, "set_specimen")
+        assert hasattr(SimulationHarness, "set_contamination")
+        assert hasattr(SimulationHarness, "set_noise")
+
+    def test_control_client_surface_is_current(self):
+        from app.digital_twin.control_client import MicroscopeControlClient
+        assert not hasattr(MicroscopeControlClient, "acquire_spectrum")
+        assert hasattr(MicroscopeControlClient, "set_autofocus_limits")
 
 
 # ---------------------------------------------------------------------------

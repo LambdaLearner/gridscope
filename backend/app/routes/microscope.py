@@ -103,22 +103,6 @@ class SetResolutionRequest(BaseModel):
         return self
 
 
-class AcquireSpectrumRequest(BaseModel):
-    ev_min: float = Field(0.0, ge=0.0, le=5000.0)
-    ev_max: float = Field(1000.0, gt=0.0, le=5000.0)
-    # n_channels capped: spectra are returned as JSON arrays and the twin
-    # allocates per channel — an absurd value is a memory/payload footgun.
-    n_channels: int = Field(1024, ge=16, le=8192)
-    cx_um: Optional[float] = None
-    cy_um: Optional[float] = None
-
-    @model_validator(mode="after")
-    def _range_ordered(self):
-        if self.ev_max <= self.ev_min:
-            raise ValueError("ev_max must be greater than ev_min")
-        return self
-
-
 # ===== Helpers =====
 
 def _stage_dict(pos) -> Dict[str, float]:
@@ -290,23 +274,6 @@ def set_resolution(request: SetResolutionRequest):
     ts.require_idle()
     result = ts.twin_call(
         ts.get_control().set_resolution, request.resolution_px, request.device
-    )
-    return {"success": True, **result}
-
-
-@router.post("/spectrum")
-def acquire_spectrum(request: AcquireSpectrumRequest):
-    """Acquire a single-spot EELS spectrum (probe parked at one position).
-    The twin's spectrum is a physically-structured dummy — the workflow and
-    API surface are what a real EELS backend would replace."""
-    ts.require_idle()
-    result = ts.twin_call(
-        ts.get_control().acquire_spectrum,
-        ev_min=request.ev_min,
-        ev_max=request.ev_max,
-        n_channels=request.n_channels,
-        cx_um=request.cx_um,
-        cy_um=request.cy_um,
     )
     return {"success": True, **result}
 

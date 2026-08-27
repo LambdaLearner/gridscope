@@ -6,7 +6,7 @@
 
 ## Overview
 
-GridScope is an AI-powered automation platform for Scanning Transmission Electron Microscopy (STEM) that bridges the gap between experimental design and instrument execution. Researchers describe imaging objectives in natural language—such as *"acquire a 5×5 grid at 3 µm spacing"* or *"explore tilt angles from 0° to 30°"*—and receive executable Python scripts validated against a physics-based Digital Twin (v6+, ported from `Digital_twin_revised_v2/STEM_Digital_Twin_Modular_final_w_PyJEM_with_abTEM.ipynb`; GUI per `Digital_twin_revised_v2/STEM_Twin_GUI_Build_Spec.md` incl. addenda A1–A6).
+GridScope is an AI-powered automation platform for Scanning Transmission Electron Microscopy (STEM) that bridges the gap between experimental design and instrument execution. Researchers describe imaging objectives in natural language—such as *"acquire a 5×5 grid at 3 µm spacing"* or *"explore tilt angles from 0° to 30°"*—and receive executable Python scripts validated against a physics-based Digital Twin (v5 kinematical core, ported from `Digital_twin_revised_v6/STEM_Digital_Twin_Kinematical_v5.ipynb`; see `Digital_twin_revised_v6/STEM_Digital_Twin_and_GridScope_CHANGELOG.md` for the physics and API record).
 
 ### The control / simulation split
 
@@ -14,14 +14,14 @@ The system keeps two surfaces strictly apart, so what you test here deploys ther
 
 - **Microscope control** (`/api/microscope`, `MicroscopeControlClient`) — every
   operation has a real-instrument counterpart: stage (with soft safety limits),
-  beam, IMG/DIFF/EELS modes, magnification↔FOV, discrete resolution windows
-  (512/1024/2048 px), detectors, image + spectrum acquisition, autofocus.
-  Generated scripts use **only** this surface.
+  beam, IMG/DIFF modes, magnification↔FOV, discrete resolution windows
+  (1024/2048/4096 px), detectors, image acquisition, autofocus (with a
+  settable acceptance threshold). Generated scripts use **only** this surface.
 - **Simulation** (`/api/simulation`, `SimulationHarness`) — twin-only test
   scaffolding with no real-HW equivalent: the sample registry and registration,
-  simulation environments, drift, beam damage, contamination, specimen
-  working-thickness selection, and the optional abTEM dynamical-diffraction
-  engine.
+  acquisition conditions set as explicit numbers (drift in nm/s, contamination
+  as % of nominal, detector noise/dose), and specimen working-thickness
+  selection. There are no named environment presets.
 
 ### Key Features
 
@@ -32,14 +32,13 @@ The system keeps two surfaces strictly apart, so what you test here deploys ther
 | **13-Sample Registry** | Fe FCC/BCC and Mg HCP crystals, polycrystals, dislocation fields, amorphous films, Au nanoparticle variants, core-shell, shape assemblies — all with schema-driven parameters and reproducibility seeds |
 | **Sample Registration** | Register a sample before imaging — like inserting a holder |
 | **Thickness Workflow** | Choose a working slab (1–100 nm) and a thickness seed deciding where in the specimen it sits |
-| **Simulation Environments** | `pristine`, `beam_sensitive`, `contaminating`, `thick_drifting`, `low_dose` — plus custom drift/damage/contamination overrides |
-| **Realistic Physics Units** | Drift in physical nm/s (0–10, wall-clock time, idle-jump guard); damage/contamination driven by real electron dose (e⁻/Å², depends on FOV × resolution × current × dwell) with a log-gradual critical-dose model |
-| **Live Mode + Dose Meter** | Continuous adaptive acquisition (the way to watch drift) and an accumulated-dose read-out against the critical dose |
-| **32-bit TIFF Export** | One-click download of the most-recent frame (kinematical or abTEM) as quantitative float TIFF with embedded ImageJ-readable metadata |
-| **EELS** | Single-spot spectra with composition-aware core-loss edges |
-| **Kinematical ⇄ abTEM** | Fast kinematical diffraction by default; optional dynamical multislice patterns (`pip install abtem`) computed on the same sample at the current stage tilt |
+| **Explicit Acquisition Conditions** | No presets: drift (nm/s + idle-time cap), contamination (% of nominal), detector noise (dwell/DQE/readout/dose model), autofocus threshold — every value user-set, bounded by a server-published limits endpoint |
+| **Realistic Physics Units** | Drift in physical nm/s (wall-clock time, settable idle-jump guard); contamination driven by real electron dose (e⁻/Å², depends on FOV × resolution × current × dwell) with a saturating-exponential footprint |
+| **Live Mode + Contamination Meter** | Continuous adaptive acquisition (the way to watch drift) and an accumulated-exposure read-out with saturation fraction |
+| **32-bit TIFF Export** | One-click download of the most-recent frame as quantitative float TIFF with embedded ImageJ-readable metadata |
+| **v5 Physics** | Rigid-rotation stage tilt with cos-law foreshortening, depth-resolved depth of field inside the projection, universal roaming (periodic wrap or hash-generated world) |
 | **Stage Safety Limits** | ±1.5 mm (x/y), ±1 mm (z), ±30° (tilt); out-of-range moves rejected |
-| **Session Seeds** | Copy/Load the exact state (sample, params, seeds, thickness, environment) as JSON |
+| **Session Seeds** | Copy/Load the exact state (sample, params, seeds, thickness, acquisition conditions) as JSON |
 | **Sandboxed Execution** | Generated scripts run server-side in a subprocess — the exact code you would deploy |
 
 ---
@@ -47,8 +46,7 @@ The system keeps two surfaces strictly apart, so what you test here deploys ther
 ## Quick Start
 
 > **First time on a new machine?** Follow the step-by-step guide in
-> **[SETUP.md](SETUP.md)** — it covers prerequisites, the abTEM version pin,
-> and troubleshooting.
+> **[SETUP.md](SETUP.md)** — it covers prerequisites and troubleshooting.
 
 ### Prerequisites
 
@@ -107,7 +105,7 @@ Access the application at `http://localhost:5173`
 
 ## Usage
 
-### 1. Sample & Environment (first tab)
+### 1. Sample & Conditions (first tab)
 
 Simulation-only configuration — nothing here exists on a real instrument:
 
@@ -120,32 +118,32 @@ Simulation-only configuration — nothing here exists on a real instrument:
   read-out of where the slab sits in the specimen
 - **Register / Load**: builds the specimen volume and resets degradation
   history. The microscope is disabled until a sample is registered.
-- **Environment**: preset bundle of realism settings (each shows what it
-  sets), plus custom drift/damage/contamination/dwell expanders that
-  override the preset
-- **Fresh specimen**: clear accumulated beam damage / contamination
+- **Acquisition conditions**: explicit, always-visible controls — drift
+  (enabled, vx/vy nm/s, jitter, idle-time cap), contamination (enabled,
+  rate as % of nominal), detector noise (dwell, DQE, readout, dose model),
+  autofocus min-contrast. What you set is exactly what the twin runs with;
+  bounds come from `GET /api/simulation/limits`.
+- **Fresh specimen**: clear accumulated contamination
 
 ### 2. Microscope (second tab)
 
 The portable control surface — every action maps to a real instrument:
 
-- **Mode Toggle**: Imaging ↔ Diffraction ↔ EELS (diffraction computed from
-  atoms, 1–5 s/frame; EELS renders as a line plot with labeled edges)
+- **Mode Toggle**: Imaging ↔ Diffraction (diffraction computed from
+  atoms, 1–5 s/frame)
 - **Live Mode**: continuous adaptive acquisition (~300 ms cadence, never
   overlapping) — drift advances with real wall-clock time, so this is how
-  you watch it; damage/contamination accumulate per frame
-- **Resolution**: 512 / 1024 / 2048 px windows (higher = finer detail, slower)
+  you watch it; contamination accumulates per frame
+- **Resolution**: 1024 / 2048 / 4096 px windows (higher = finer detail, slower; 4096 is offline-capture only)
 - **Stage Control**: X/Y moves; rejected moves show the twin's safety-limit message
 - **Focus (z)**: live read-out with fine (±0.25 µm) and coarse (±25 µm) steps —
   fine steps visibly change sharpness (manual companion to Autofocus)
 - **Tilt Control**: α/β within ±30°
 - **Save TIFF**: downloads the most-recent frame as 32-bit float TIFF with the
   acquisition context embedded (mode, sample, mag, resolution, thickness, tilt)
-- **Dose meter**: accumulated e⁻/Å² under the beam vs the critical dose
+- **Contamination meter**: accumulated e⁻/Å² under the beam and % saturated
 - **Field of View / Magnification**: linked field pair (mag = k / FOV)
-- **Diffraction**: aperture / depth / camera length / beamstop, plus the
-  Kinematical ⇄ abTEM engine toggle with an explicit "Compute dynamical
-  pattern" button (greyed if `abtem` isn't installed on the backend)
+- **Diffraction**: aperture / depth / camera length / beamstop settings
 - **Beam Settings**: Voltage (60–300 kV) and Current (5–200 pA)
 - **Autofocus**: can legitimately fail to converge — the UI reports why
 
@@ -171,7 +169,11 @@ owns the instrument.
 - Diffraction computed directly from atomic positions in the illuminated
   region (crystals → spots, polycrystals → rings, amorphous → diffuse halos)
 - Poisson-dose noise model, probe PSF with defocus and aberrations
-- Mechanical drift (between- and intra-frame), beam damage, contamination
+- Mechanical drift (between- and intra-frame) and geometric contamination
+- Rigid-rotation stage tilt (cos-law foreshortening) with depth-resolved
+  depth of field applied per depth slice inside the projection
+- Universal roaming: the stage can drive indefinitely — twelve samples wrap
+  periodically, `shape_assembly` generates a deterministic unbounded world
 - Inherent length scales: raise magnification to resolve each sample's features
 - Stage soft limits enforced server-side; a rejected move does not move the stage
 
@@ -193,16 +195,18 @@ owns the instrument.
 | `/api/microscope/limits` | GET | Stage soft limits |
 | `/api/microscope/stage` | GET/POST | Stage position (400 on limit rejection) |
 | `/api/microscope/acquire` | POST | Acquire frame (IMG/DIFF, PNG payload) |
-| `/api/microscope/spectrum` | POST | Single-spot EELS spectrum |
-| `/api/microscope/resolution` | GET/POST | Discrete acquisition windows (512/1024/2048) |
+| `/api/microscope/resolution` | GET/POST | Discrete acquisition windows (1024/2048/4096) |
 | `/api/microscope/diffraction` | GET/POST | Kinematical diffraction settings |
 | `/api/microscope/capture.tiff` | GET | Download the most-recent frame as 32-bit TIFF (404 before first acquire) |
 | `/api/microscope/autofocus` | POST | Autofocus (reports `converged`) |
 | `/api/simulation/samples` | GET | Sample registry (incl. `param_schema` + defaults) |
 | `/api/simulation/sample/register` | POST | Register the active sample (params, volume, thickness) |
 | `/api/simulation/thickness` | GET/POST | Working-thickness selection (409 without a sample) |
-| `/api/simulation/environment` | GET/POST | Simulation environment |
-| `/api/simulation/diffraction/abtem` | POST | Dynamical (multislice) SAED — 501 without `abtem`, cached per state |
+| `/api/simulation/limits` | GET | Bounds for every free-form condition field |
+| `/api/simulation/drift` | GET/POST | Drift (nm/s, jitter, idle-time cap) |
+| `/api/simulation/contamination` | POST | Contamination (enabled, % of nominal) |
+| `/api/simulation/noise` | POST | Detector noise / dose parameters |
+| `/api/simulation/autofocus-limits` | POST | Autofocus acceptance threshold |
 | `/api/execute/run` | POST | Run a script sandboxed (SSE stream) |
 | `/api/chat` | POST | AI assistant |
 | `/api/code/generate` | POST | Generate portable Python code |

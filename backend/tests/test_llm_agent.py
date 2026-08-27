@@ -33,10 +33,10 @@ class TestSystemPrompt:
             assert method in SYSTEM_PROMPT, f"Missing control method: {method}"
 
     def test_prompt_forbids_simulation_code(self):
-        # The prompt may EXPLAIN that samples/environments are UI-only, but it
+        # The prompt may EXPLAIN that samples/conditions are UI-only, but it
         # must never document simulation calls as usable API.
-        for forbidden in ["mic.load_sample", "mic.set_environment",
-                          "mic.set_drift", "mic.set_specimen",
+        for forbidden in ["mic.load_sample", "mic.set_contamination",
+                          "mic.set_noise", "mic.set_drift", "mic.set_thickness",
                           "SimulationHarness(", "STEMClient"]:
             assert forbidden not in SYSTEM_PROMPT, f"Found: {forbidden}"
 

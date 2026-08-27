@@ -15,8 +15,6 @@ Install these first if you don't have them:
 | **Node.js** | ≥ 18 | `node --version` | https://nodejs.org (LTS is fine) |
 | **Python** | 3.10 or newer | `python3 --version` (Windows: `python --version`) | https://python.org |
 
-> **Note your Python version** — it matters for one optional dependency
-> (abTEM) in step 4.
 
 ### Python too old? (macOS ships 3.9.6)
 
@@ -66,27 +64,7 @@ Pillow, tifffile (TIFF export), pytest, and the OpenAI client.
 
 ---
 
-## 4. Optional: abTEM (dynamical diffraction)
-
-The app works fully without this — the Kinematical⇄abTEM toggle in the
-Diffraction panel is simply greyed out. To enable dynamical (multislice)
-diffraction patterns, the version depends on your Python:
-
-```bash
-# Python 3.10:
-pip install abtem==1.0.6
-
-# Python 3.11 or newer:
-pip install abtem
-```
-
-> Why the pin: abtem 1.0.8+ requires Python ≥ 3.11, and abtem ≤ 1.0.5
-> breaks on NumPy 2. If you hit a numpy-related import error after
-> installing abtem, run `pip install "numpy<2"`.
-
----
-
-## 5. Optional: OpenAI API key (AI assistant)
+## 4. Optional: OpenAI API key (AI assistant)
 
 The AI chat assistant needs an OpenAI key. Everything else (manual
 microscope control, samples, environments, script execution) works without
@@ -100,7 +78,7 @@ cp env.example .env
 
 ---
 
-## 6. Frontend setup (Node)
+## 5. Frontend setup (Node)
 
 ```bash
 cd ..            # back to the repo root
@@ -109,7 +87,7 @@ npm install
 
 ---
 
-## 7. Run it — three terminals
+## 6. Run it — three terminals
 
 All three processes must run at the same time. Open three terminals in the
 repo root.
@@ -142,7 +120,7 @@ Then open **http://localhost:5173** in your browser.
 
 ---
 
-## 8. First steps in the app
+## 7. First steps in the app
 
 The microscope is disabled until a specimen is registered (like a real
 instrument with no holder inserted):
@@ -157,24 +135,23 @@ instrument with no holder inserted):
 
 Things worth trying:
 
-- **Live mode** with the `thick_drifting` environment — watch the field
-  drift in real time.
+- **Live mode** with drift enabled (Acquisition conditions → Mechanical
+  drift, e.g. 2 nm/s at a ≤1 µm FOV) — watch the field drift in real time.
 - **Zoom in** (raise magnification / shrink FOV below ~50 nm) on a crystal
   to resolve atomic columns; raise **Resolution** to 1024/2048 px.
-- **Diffraction mode**, then tilt α/β to navigate zone axes. If abTEM is
-  installed, toggle the engine and hit **Compute dynamical pattern**.
-- **EELS mode** — the core-loss edges match the elements under the probe.
-- **beam_sensitive** environment at small FOV — watch the **dose meter**
-  climb and the image fade past the critical dose.
+- **Diffraction mode**, then tilt α/β to navigate zone axes.
+- **Contamination** on (Acquisition conditions) at a small FOV — watch the
+  **contamination meter** climb and a bright scan-box footprint form where
+  the beam dwells.
 - **TIFF** button — downloads the current frame as a quantitative 32-bit
   TIFF with the acquisition context embedded (opens in ImageJ/Fiji).
 
 ---
 
-## 9. Verify the install (optional)
+## 8. Verify the install (optional)
 
 ```bash
-# Backend tests (~2 min; the 2 abTEM tests auto-skip if abtem isn't installed)
+# Backend tests (~2 min)
 cd backend && venv/bin/python -m pytest        # Windows: venv\Scripts\python -m pytest
 
 # Frontend tests (~5 s)
@@ -185,17 +162,14 @@ Everything should pass on a clean checkout.
 
 ---
 
-## 10. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | Twin fails with `Address already in use` (port 9094) | An old twin is still running: `lsof -ti :9094 \| xargs kill` (macOS/Linux) or find and kill the python process (Windows), then restart. **A stale twin serves stale code** — always restart it after pulling changes. |
 | Frontend shows **Disconnected** | Make sure Terminals 1 AND 2 are both running; the UI talks to the API on `localhost:8000`, which talks to the twin on `9094`. |
 | `ModuleNotFoundError` in the backend | The venv isn't activated, or you're using a different Python. Re-run the activate command; check `which python` points into `backend/venv`. |
-| abTEM toggle greyed out | Expected when `abtem` isn't installed — see step 4. The tooltip says the same. |
-| abTEM import error mentioning `typing.Self` | Your Python is 3.10 but you installed a too-new abtem: `pip install abtem==1.0.6`. |
-| abTEM import error mentioning `itemset` | numpy 2 with an old abtem: `pip install "numpy<2"`. |
-| AI assistant returns an error | No `OPENAI_API_KEY` in `backend/.env` (step 5). Everything else still works. |
+| AI assistant returns an error | No `OPENAI_API_KEY` in `backend/.env` (step 4). Everything else still works. |
 | `npm run dev` port conflict | Vite will offer another port; accept it, or free 5173. |
 
 ---

@@ -16,7 +16,6 @@ vi.mock('../../api/digitalTwin', async (importOriginal) => {
   return {
     ...original,
     acquireImage: vi.fn(),
-    acquireSpectrum: vi.fn(),
     runAutofocus: vi.fn(),
     setStagePosition: vi.fn(),
     setDetectorSettings: vi.fn(),
@@ -24,15 +23,6 @@ vi.mock('../../api/digitalTwin', async (importOriginal) => {
     setMode: vi.fn(),
     setBeamSettings: vi.fn(),
     setResolution: vi.fn(),
-  };
-});
-
-vi.mock('../../api/simulation', async (importOriginal) => {
-  const original = await importOriginal<typeof import('../../api/simulation')>();
-  return {
-    ...original,
-    getAbtemAvailability: vi.fn().mockResolvedValue({ available: true, detail: null }),
-    computeAbtemDiffraction: vi.fn(),
   };
 });
 
@@ -55,7 +45,6 @@ const SESSION: SessionSnapshot = {
       },
     },
     diffraction: { camera_length_mm: 800 },
-    environment: 'pristine',
     sample: { name: 'fcc_single_crystal', registered: true },
     stage_limits: { x: 1.5e-3, y: 1.5e-3, z: 1e-3, a: 30, b: 30 },
   },
@@ -187,18 +176,16 @@ describe('MicroscopeControlsPanel', () => {
 });
 
 describe('MicroscopeControlsPanel — v6+ features', () => {
-  const DIFF_SESSION: SessionSnapshot = {
-    ...SESSION,
-    state: { ...SESSION.state!, mode: 'DIFF' },
-  };
-
-  it('offers all three modes labelled STEM / SAED / EELS', () => {
+  it('offers exactly two modes labelled STEM / SAED', () => {
     render(
       <MicroscopeControlsPanel session={SESSION} sampleRegistered={true} runActive={false} />,
     );
-    expect(screen.getByRole('button', { name: /STEM/ })).toBeTruthy();
+    const stem = screen.getByRole('button', { name: /STEM/ });
+    expect(stem).toBeTruthy();
     expect(screen.getByRole('button', { name: /SAED/ })).toBeTruthy();
-    expect(screen.getByRole('button', { name: /EELS/i })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /EELS/i })).toBeNull();
+    // the mode toggle holds exactly the two buttons
+    expect(stem.parentElement!.querySelectorAll('button')).toHaveLength(2);
     // viewer badge names the technique explicitly
     expect(screen.getByText('STEM imaging')).toBeTruthy();
   });
@@ -229,84 +216,6 @@ describe('MicroscopeControlsPanel — v6+ features', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: /^2048$/ }));
     await waitFor(() => expect(twin.setResolution).toHaveBeenCalledWith(2048));
-  });
-
-  it('shows the kinematical⇄abTEM engine toggle in DIFF mode', async () => {
-    render(
-      <MicroscopeControlsPanel session={DIFF_SESSION} sampleRegistered={true} runActive={false} />,
-    );
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: /Kinematical/i })).toBeTruthy();
-      expect(screen.getByRole('button', { name: /abTEM/i })).toBeTruthy();
-    });
-  });
-
-  it('greys the abTEM toggle when the backend reports it unavailable', async () => {
-    const sim = await import('../../api/simulation');
-    vi.mocked(sim.getAbtemAvailability).mockResolvedValue({
-      available: false,
-      detail: 'The dynamical-diffraction engine requires `abtem` and `ase`.',
-    });
-    render(
-      <MicroscopeControlsPanel session={DIFF_SESSION} sampleRegistered={true} runActive={false} />,
-    );
-    await waitFor(() => {
-      const toggle = screen.getByRole('button', { name: /abTEM/i }) as HTMLButtonElement;
-      expect(toggle.disabled).toBe(true);
-      expect(toggle.title).toMatch(/not installed/i);
-    });
-  });
-
-  it('computes a dynamical pattern via the explicit button (never auto)', async () => {
-    const sim = await import('../../api/simulation');
-    vi.mocked(sim.getAbtemAvailability).mockResolvedValue({ available: true, detail: null });
-    vi.mocked(sim.computeAbtemDiffraction).mockResolvedValue({
-      success: true,
-      engine: 'abtem',
-      image: { image_base64: 'aW1n', width: 256, height: 256, dtype: 'uint16' },
-      state: {
-        sample: 'fcc_single_crystal', params: {}, tilt_a_deg: 0, tilt_b_deg: 0,
-        energy_kev: 200, num_frozen_phonons: 0,
-      },
-      fingerprint: 'abc123', n_atoms: 5000, compute_seconds: 3.2, cached: false,
-    });
-    render(
-      <MicroscopeControlsPanel session={DIFF_SESSION} sampleRegistered={true} runActive={false} />,
-    );
-    await waitFor(() => screen.getByRole('button', { name: /abTEM/i }));
-    fireEvent.click(screen.getByRole('button', { name: /abTEM/i }));
-    fireEvent.click(screen.getByRole('button', { name: /Compute dynamical pattern/i }));
-    await waitFor(() => {
-      expect(sim.computeAbtemDiffraction).toHaveBeenCalledWith({ num_frozen_phonons: 0 });
-      expect(screen.getByText(/abTEM · 5,000 atoms/)).toBeTruthy();
-    });
-  });
-
-  it('acquires an EELS spectrum in EELS mode and plots it', async () => {
-    const eelsSession: SessionSnapshot = {
-      ...SESSION,
-      state: { ...SESSION.state!, mode: 'EELS' },
-    };
-    vi.mocked(twin.acquireSpectrum).mockResolvedValue({
-      success: true,
-      energy_ev: [0, 500, 1000],
-      intensity: [1, 0.2, 0.05],
-      edges: [{ label: 'Fe-L', onset_ev: 708, Z: 26 }],
-      zlp_ev: 0, plasmon_ev: 17.6, thickness_nm: 100, elements_Z: [26],
-    });
-    render(
-      <MicroscopeControlsPanel session={eelsSession} sampleRegistered={true} runActive={false} />,
-    );
-    fireEvent.click(screen.getByRole('button', { name: /^Acquire$/i }));
-    await waitFor(() => {
-      // probes the STAGE position, not the sample centre (position-truth fix)
-      expect(twin.acquireSpectrum).toHaveBeenCalledWith({
-        ev_min: 0, ev_max: 1000, n_channels: 1024, cx_um: 0, cy_um: 0,
-      });
-      expect(screen.getByTestId('spectrum-plot')).toBeTruthy();
-      expect(screen.getByTestId('edge-Fe-L')).toBeTruthy();
-    });
-    expect(twin.acquireImage).not.toHaveBeenCalled();
   });
 });
 
@@ -371,40 +280,39 @@ describe('MicroscopeControlsPanel — v2 addenda (z, Live, TIFF, dose meter)', (
     });
   });
 
-  it('shows the dose meter when damage is enabled, with accumulated vs critical dose', () => {
-    const withDose: SessionSnapshot = {
+  it('shows the contamination meter when contamination is on, with accumulated exposure', () => {
+    const withContam: SessionSnapshot = {
       ...SESSION,
       state: {
         ...SESSION.state!,
         specimen: {
-          beam_damage_enabled: 1, contamination_enabled: 0,
-          damage_dose_threshold: 3e4, damage_rate: 1, contamination_rate: 1,
-          max_accumulated_dose: 1.5e4, max_contamination: 0,
+          contamination_enabled: 1, contamination_rate: 100,
+          max_contamination: 7.7,
         },
       },
     };
     render(
-      <MicroscopeControlsPanel session={withDose} sampleRegistered={true} runActive={false} />,
+      <MicroscopeControlsPanel session={withContam} sampleRegistered={true} runActive={false} />,
     );
     const meter = screen.getByTestId('dose-meter');
-    expect(meter.textContent).toMatch(/1\.5e\+4/);
-    expect(meter.textContent).toMatch(/critical 3\.0e\+4/);
+    expect(meter.textContent).toMatch(/7\.7e\+0/);
+    // 1 - exp(-7.7/7.7) = 63% saturated at exactly one CONTAM_DOSE_SCALE
+    expect(meter.textContent).toMatch(/63% saturated/);
   });
 
-  it('hides the dose meter when neither damage nor contamination is on', () => {
-    const noDose: SessionSnapshot = {
+  it('hides the contamination meter when contamination is off', () => {
+    const noContam: SessionSnapshot = {
       ...SESSION,
       state: {
         ...SESSION.state!,
         specimen: {
-          beam_damage_enabled: 0, contamination_enabled: 0,
-          damage_dose_threshold: 3e4, damage_rate: 1, contamination_rate: 1,
-          max_accumulated_dose: 0, max_contamination: 0,
+          contamination_enabled: 0, contamination_rate: 100,
+          max_contamination: 0,
         },
       },
     };
     render(
-      <MicroscopeControlsPanel session={noDose} sampleRegistered={true} runActive={false} />,
+      <MicroscopeControlsPanel session={noContam} sampleRegistered={true} runActive={false} />,
     );
     expect(screen.queryByTestId('dose-meter')).toBeNull();
   });

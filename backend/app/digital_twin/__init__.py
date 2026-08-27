@@ -1,7 +1,7 @@
 """STEM Digital Twin v6 — simulation server and split clients.
 
 MicroscopeControlClient — portable instrument control (real-HW counterparts).
-SimulationHarness       — twin-only configuration (sample, environment, drift).
+SimulationHarness       — twin-only configuration (sample, conditions, drift).
 STEMServer / start_server — the Twisted digital-twin server itself.
 """
 

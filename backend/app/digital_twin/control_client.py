@@ -133,22 +133,19 @@ class MicroscopeControlClient:
     # ---- acquisition ----
     def acquire_image(self, device, **kw): return self._decode(self._call("acquire_image", {"device": device, **kw}))
 
-    # ---- EELS (single-spot spectrum; probe parked at one position) ----
-    # Real instruments expose the same acquisition; the twin returns a
-    # physically-structured dummy spectrum (ZLP, plasmon, core-loss edges).
-    def acquire_spectrum(self, ev_min=0.0, ev_max=1000.0, n_channels=1024,
-                         cx_um=None, cy_um=None):
-        p = {"ev_min": ev_min, "ev_max": ev_max, "n_channels": n_channels}
-        if cx_um is not None: p["cx_um"] = cx_um
-        if cy_um is not None: p["cy_um"] = cy_um
-        return self._call("acquire_spectrum", p)
-
     # ---- autofocus ----
     # A real instrument-side routine; its FAILURE behavior on the twin is driven
-    # by the simulation environment (configured in the twin's UI), which is
+    # by the acquisition conditions (drift, noise, contamination), which is
     # exactly what lets a workflow's failure-handling be tested.
     def autofocus(self, device="haadf", z_range_um=2.0, z_steps=9):
         return self._call("autofocus", {"device": device, "z_range_um": z_range_um, "z_steps": z_steps})
+
+    # Peak/floor contrast ratio below which autofocus reports non-convergence.
+    # Real autofocus routines expose the same kind of acceptance threshold.
+    def set_autofocus_limits(self, min_contrast=None):
+        p = {}
+        if min_contrast is not None: p["min_contrast"] = min_contrast
+        return self._call("set_autofocus_limits", p)
 
     # ---- full-state snapshot (real instruments expose the same introspection) ----
     def get_microscope_state(self): return self._call("get_microscope_state")
