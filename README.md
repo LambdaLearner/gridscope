@@ -90,6 +90,17 @@ npm run dev
 
 Access the application at `http://localhost:5173`
 
+### Security & network exposure
+
+The backend binds to loopback (`127.0.0.1`) by default and is unreachable
+from the network. Exposing it (`HOST=0.0.0.0`) is an explicit opt-in and
+must be paired with `GRIDSCOPE_API_TOKEN`, which enforces bearer-token
+authentication on every endpoint — including stage control, server-side
+script execution, and the OpenAI-backed chat/codegen routes. Set the same
+token as `VITE_GRIDSCOPE_API_TOKEN` for the frontend. For networked use,
+put a TLS-terminating reverse proxy in front. See **SETUP.md → Security &
+network exposure** for details.
+
 ---
 
 ### Components

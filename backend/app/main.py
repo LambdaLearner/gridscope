@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
+from .auth import BearerTokenAuthMiddleware
 from .routes import (
     chat_router,
     code_router,
@@ -54,6 +55,12 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+# Opt-in bearer-token auth (see app/auth.py). Must be added BEFORE the CORS
+# middleware: Starlette mounts the last-added middleware outermost, and CORS
+# has to be outermost so it can answer preflight OPTIONS requests, which
+# browsers send without Authorization headers.
+app.add_middleware(BearerTokenAuthMiddleware)
 
 # Configure CORS for frontend
 app.add_middleware(

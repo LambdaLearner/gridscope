@@ -7,7 +7,7 @@
  * and a final done event.
  */
 
-import { API_BASE_URL, ApiError } from './client';
+import { API_BASE_URL, ApiError, authHeaders } from './client';
 
 export interface RunLogEvent { type: 'log'; message: string }
 export interface RunErrorEvent { type: 'error'; message: string }
@@ -31,7 +31,9 @@ export interface RunStatus {
 }
 
 export async function getRunStatus(): Promise<RunStatus> {
-  const response = await fetch(`${API_BASE_URL}/execute/status`);
+  const response = await fetch(`${API_BASE_URL}/execute/status`, {
+    headers: authHeaders(),
+  });
   if (!response.ok) throw new ApiError(response.status, 'Failed to get run status');
   return response.json();
 }
@@ -48,7 +50,7 @@ export async function runScript(
 ): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/execute/run`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({
       code,
       timeout_s: options.timeoutS ?? 300,

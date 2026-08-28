@@ -65,6 +65,18 @@ describe('runScript', () => {
     }
   });
 
+  it('forwards the bearer token on the run request when configured', async () => {
+    vi.stubEnv('VITE_GRIDSCOPE_API_TOKEN', 'tok-123');
+    try {
+      mockFetch.mockResolvedValue(sseResponse([]));
+      await runScript('x', () => {});
+      const [, init] = mockFetch.mock.calls[0];
+      expect(init.headers).toMatchObject({ Authorization: 'Bearer tok-123' });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('emits an error event for a malformed frame instead of crashing', async () => {
     mockFetch.mockResolvedValue(
       sseResponse(['data: this is not json\n\n', 'data: {"type": "done", "exit_code": 0, "elapsed_s": 0, "images": 0}\n\n']),

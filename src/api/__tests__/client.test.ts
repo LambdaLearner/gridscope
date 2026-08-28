@@ -3,8 +3,8 @@
  * safety-limit rejections reach the user verbatim.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { apiFetch, ApiError } from '../client';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { apiFetch, ApiError, authHeaders } from '../client';
 
 const mockFetch = vi.fn();
 global.fetch = mockFetch as unknown as typeof fetch;
@@ -96,5 +96,35 @@ describe('apiFetch', () => {
       expect((e as ApiError).status).toBe(0);
       expect((e as ApiError).isUnavailable).toBe(true);
     }
+  });
+});
+
+describe('auth token', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('authHeaders is empty when no token is configured', () => {
+    expect(authHeaders()).toEqual({});
+  });
+
+  it('authHeaders carries the bearer token when configured', () => {
+    vi.stubEnv('VITE_GRIDSCOPE_API_TOKEN', 'tok-123');
+    expect(authHeaders()).toEqual({ Authorization: 'Bearer tok-123' });
+  });
+
+  it('apiFetch attaches the Authorization header when a token is set', async () => {
+    vi.stubEnv('VITE_GRIDSCOPE_API_TOKEN', 'tok-123');
+    mockFetch.mockResolvedValue(jsonResponse(200, {}));
+    await apiFetch('/health');
+    const [, init] = mockFetch.mock.calls[0];
+    expect(init.headers).toMatchObject({ Authorization: 'Bearer tok-123' });
+  });
+
+  it('apiFetch sends no Authorization header when no token is set', async () => {
+    mockFetch.mockResolvedValue(jsonResponse(200, {}));
+    await apiFetch('/health');
+    const [, init] = mockFetch.mock.calls[0];
+    expect(init.headers).not.toHaveProperty('Authorization');
   });
 });

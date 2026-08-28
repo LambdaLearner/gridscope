@@ -8,6 +8,18 @@
 
 export const API_BASE_URL = 'http://localhost:8000/api';
 
+/**
+ * Bearer-token auth headers, or {} when no token is configured.
+ *
+ * Mirrors the backend's opt-in auth: set VITE_GRIDSCOPE_API_TOKEN to the
+ * same value as the server's GRIDSCOPE_API_TOKEN. Read at call time (not
+ * module load) so tests can stub the env.
+ */
+export function authHeaders(): Record<string, string> {
+  const token = import.meta.env.VITE_GRIDSCOPE_API_TOKEN as string | undefined;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 export class ApiError extends Error {
   /** HTTP status; 0 means the backend itself was unreachable. */
   status: number;
@@ -38,7 +50,7 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   let response: Response;
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       ...init,
     });
   } catch (e) {

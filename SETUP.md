@@ -181,3 +181,37 @@ Everything should pass on a clean checkout.
 | 9094 | Digital Twin (Twisted JSON-RPC) |
 | 8000 | Backend API (FastAPI) |
 | 5173 | Frontend dev server (Vite) |
+
+---
+
+## Security & network exposure
+
+GridScope is a single-user research tool. By default the backend binds to
+**loopback only** (`127.0.0.1`), so nothing on your network can reach it —
+this is the configuration every step above assumes, and it needs no further
+setup.
+
+Exposing the backend on a network interface is an explicit opt-in and
+should always be paired with an access token, because the API includes
+endpoints that move the (simulated) stage, execute Python scripts
+server-side, and spend OpenAI credit:
+
+```bash
+# backend/.env
+HOST=0.0.0.0                       # deliberate exposure — off by default
+GRIDSCOPE_API_TOKEN=<random-token> # required auth on every endpoint
+
+# frontend (.env.local in the repo root)
+VITE_GRIDSCOPE_API_TOKEN=<same-token>
+```
+
+Generate a token with
+`python -c "import secrets; print(secrets.token_urlsafe(32))"`. When the
+token is set, every request (including `/docs` and the script-run stream)
+must send `Authorization: Bearer <token>`; the frontend does this
+automatically when `VITE_GRIDSCOPE_API_TOKEN` is set. `run.py` prints a
+warning if you bind a non-loopback interface without a token.
+
+The server speaks plain HTTP. If you ever run it across a shared network,
+terminate TLS in front of it with a standard reverse proxy (nginx, caddy);
+certificate handling is deliberately out of scope for this codebase.
