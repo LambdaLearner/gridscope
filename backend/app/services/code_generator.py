@@ -18,6 +18,7 @@ from ..constants import (
     IMAGE_MARKER,
     MICROSCOPE_API_SPEC,
 )
+from .llm_config import get_model, get_temperature, log_llm_call
 
 
 def _load_control_client_code() -> str:
@@ -209,7 +210,8 @@ class MicroscopyCodeGenerator:
             self.client = AsyncOpenAI(api_key=self.api_key)
         else:
             self.client = None
-        self.model = os.getenv("OPENAI_MODEL", "gpt-4o")
+        self.model = get_model()
+        self.temperature = get_temperature()
 
     def _get_config_values(self, config: Optional[ExperimentConfig]) -> dict:
         """Extract configuration values with defaults."""
@@ -309,9 +311,10 @@ Respond with JSON:
                 },
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.3,
+            temperature=self.temperature,
             max_tokens=4000,
         )
+        log_llm_call("code_generation", self.model, self.temperature, response)
 
         import json
         try:

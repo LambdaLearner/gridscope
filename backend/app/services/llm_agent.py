@@ -10,6 +10,7 @@ from typing import Optional
 from openai import AsyncOpenAI
 from ..models.schemas import ChatMessage, ExperimentConfig
 from ..constants import MICROSCOPE_API_SPEC, WORKFLOW_TEMPLATES
+from .llm_config import get_model, get_temperature, log_llm_call
 
 
 def _build_workflow_templates_prompt() -> str:
@@ -86,7 +87,8 @@ class LLMAgent:
             raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY environment variable.")
         
         self.client = AsyncOpenAI(api_key=self.api_key)
-        self.model = os.getenv("OPENAI_MODEL", "gpt-4o")
+        self.model = get_model()
+        self.temperature = get_temperature()
 
     def _build_context(self, experiment_config: Optional[ExperimentConfig] = None) -> str:
         """Build context string from experiment configuration."""
@@ -147,9 +149,10 @@ class LLMAgent:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=openai_messages,
-            temperature=0.7,
+            temperature=self.temperature,
             max_tokens=2000,
         )
+        log_llm_call("chat", self.model, self.temperature, response)
 
         return response.choices[0].message.content or ""
 
@@ -185,9 +188,10 @@ Respond in this exact JSON format:
                 {"role": "system", "content": "You are a microscopy expert. Respond only with valid JSON."},
                 {"role": "user", "content": analysis_prompt}
             ],
-            temperature=0.3,
+            temperature=self.temperature,
             max_tokens=500,
         )
+        log_llm_call("analyze_objective", self.model, self.temperature, response)
 
         import json
         try:

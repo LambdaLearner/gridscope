@@ -76,6 +76,13 @@ cp env.example .env
 # then edit .env and set:  OPENAI_API_KEY=sk-...
 ```
 
+The model defaults to the pinned snapshot `gpt-4o-2024-08-06` and sampling
+temperature defaults to `0` (deterministic-as-possible). Override with
+`OPENAI_MODEL` and `OPENAI_TEMPERATURE` in `.env` if needed. Every LLM call
+is appended to `llm_calls.jsonl` (path override: `GRIDSCOPE_LLM_LOG`) with
+the requested model, the snapshot OpenAI actually served, and the
+temperature — this is the reproducibility record for the AI assistant.
+
 ---
 
 ## 5. Frontend setup (Node)

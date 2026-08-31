@@ -110,7 +110,7 @@ network exposure** for details.
 | Frontend | React, TypeScript, Tailwind | Sample settings, microscope controls, AI chat, execution panel |
 | Backend | FastAPI, Python | Control/simulation routing, sandboxed script runner, LLM orchestration |
 | Digital Twin | Twisted JSON-RPC (`backend/app/digital_twin/`) | STEM physics simulation (v6) |
-| AI Agent | OpenAI GPT-4 | Natural language to portable Python code |
+| AI Agent | OpenAI GPT-4o (`gpt-4o-2024-08-06`; override via `OPENAI_MODEL`) | Natural language to portable Python code |
 
 ---
 
